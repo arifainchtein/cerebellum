@@ -127,8 +127,11 @@ public class Cerebellum {
 
             // Extract Cerebellum Task Denes from Internal->Cerebellum DeneChain
             List<JSONObject> taskDenes = getCerebellumTaskDenes(pulse);
-            if (taskDenes.isEmpty()) return;
-
+            if (taskDenes.isEmpty()) {
+            	logger.debug("there are no Tasks");
+            	return;
+            }
+            logger.debug("there are " + taskDenes.size() + " Tasks");
             // Sort by Evaluation Position
             taskDenes.sort(Comparator.comparingInt(d ->
                     getDeneWordInt(d, TeleonomeConstants.DENEWORD_CEREBELLUM_EVALUATION_POSITION)));
@@ -153,7 +156,7 @@ public class Cerebellum {
                         logger.debug("No telepathon found for device: " + telepathonType);
                         continue;
                     }
-
+                    logger.debug("about to evaluate ");
                     // Evaluate JEXL Expression with condition pointer bindings
                     String expression = getDeneWordString(taskDene,
                             TeleonomeConstants.DENEWORD_CEREBELLUM_EXPRESSION);
@@ -166,6 +169,8 @@ public class Cerebellum {
                     String className = getDeneWordString(taskDene,
                             TeleonomeConstants.DENEWORD_CEREBELLUM_TASK_TRUE_EXPRESSION);
                     Task task = getOrCreateTask(className, telepathonType);
+                    logger.debug("line 173 className= " +className + " task is null=" + (task == null));
+
                     if (task == null) continue;
 
                     // Execute — task returns empty array if not yet time to publish results
@@ -181,12 +186,15 @@ public class Cerebellum {
                     String frequency = getDeneWordString(taskDene,
                             TeleonomeConstants.DENEWORD_CEREBELLUM_EXECUTION_FREQUENCY);
                     String matchedSlot = matchExecutionSlot(executionTime, frequency, telepathon);
+                    logger.debug("line 189 executionTime= " +executionTime + " frequency=" + frequency + " matchedSlot=" + matchedSlot);
                     if (matchedSlot == null) {
                         logger.debug("No execution slot matched for "
                                 + task.getName() + "/" + telepathonType);
                         continue;
                     }
                     String trackingKey = className + ":" + telepathonType + ":" + matchedSlot;
+                    logger.debug("line 196 trackingKey= " +trackingKey);
+                    
                     if (!isFrequencyAllowed(trackingKey)) {
                         logger.debug("Slot '" + matchedSlot + "' already ran today for "
                                 + task.getName() + "/" + telepathonType);
