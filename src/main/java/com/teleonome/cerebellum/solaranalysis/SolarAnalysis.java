@@ -1,8 +1,11 @@
 package com.teleonome.cerebellum.solaranalysis;
 
+
+
 import com.luckycatlabs.sunrisesunset.SunriseSunsetCalculator;
 import com.luckycatlabs.sunrisesunset.dto.Location;
 import com.teleonome.cerebellum.Task;
+import org.apache.log4j.Logger;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
@@ -45,6 +48,7 @@ public class SolarAnalysis implements Task {
     private static final int    WAKE_TIME_SEC_SATURATED   = 255;
     private static final double LOW_BATTERY_ALERT_PCT     = 20.0; // warn if projected SOC < this
 
+    private final Logger logger = Logger.getLogger(getClass());
     private final String deviceName;
 
     // Each entry: [timeSeconds, voltage, batteryCurrent_mA, sleepTime_s, operatingStatus, lux, wakeTimeSec]
@@ -76,7 +80,10 @@ public class SolarAnalysis implements Task {
         double lon            = getDeneWordDouble(telepathon, "Configuration", "longitude");
         long   timeSeconds    = telepathon.optLong("Seconds Time", System.currentTimeMillis() / 1000);
 
-        if (lat == 0) return new JSONArray();
+        if (lat == 0) {
+            logger.debug("SolarAnalysis[" + deviceName + "]: skipping — lat=0");
+            return new JSONArray();
+        }
 
         // Reset accumulation at midnight
         Calendar midnight = Calendar.getInstance(TimeZone.getTimeZone(TIMEZONE));
@@ -86,17 +93,23 @@ public class SolarAnalysis implements Task {
         midnight.set(Calendar.MILLISECOND, 0);
         long midnightEpoch = midnight.getTimeInMillis() / 1000;
         if (midnightEpoch > todayMidnight) {
+            logger.info("SolarAnalysis[" + deviceName + "]: midnight reset — clearing " + history.size() + " records");
             history.clear();
             todayMidnight = midnightEpoch;
         }
 
         history.add(new double[]{timeSeconds, voltage, batteryCurrent, sleepSec, status, lux, wakeTimeSec});
+        logger.debug("SolarAnalysis[" + deviceName + "]: recorded V=" + voltage
+                + " I=" + batteryCurrent + "mA status=" + status
+                + " lux=" + lux + " wake=" + wakeTimeSec + "s  history=" + history.size());
 
         // Update best anchor if voltage breaks above the flat LiFePO4 plateau
         if (voltage >= RELIABLE_ANCHOR_VOLTAGE) {
             double anchorSoc = estimateSocPct(voltage);
             if (bestAnchor == null || anchorSoc > bestAnchor[1]) {
                 bestAnchor = new double[]{timeSeconds, anchorSoc};
+                logger.info("SolarAnalysis[" + deviceName + "]: new reliable anchor "
+                        + voltage + "V = " + anchorSoc + "% SOC");
             }
         }
 
@@ -112,11 +125,17 @@ public class SolarAnalysis implements Task {
         long nowEpoch = System.currentTimeMillis() / 1000;
         boolean nearSunset = Math.abs(nowEpoch - sunsetEpoch) <= 1800;
 
+        logger.debug("SolarAnalysis[" + deviceName + "]: hour=" + hour
+                + " nearSunset=" + nearSunset + " cycles=" + wakeCycleRepresentatives().size());
+
         if (nearSunset) {
+            logger.info("SolarAnalysis[" + deviceName + "]: FIRING sunset run");
             return runSunset(sunriseEpoch, sunsetEpoch);
         } else if (hour == 15) {
+            logger.info("SolarAnalysis[" + deviceName + "]: FIRING 15h run");
             return runIntermediate("15h", sunsetEpoch);
         } else if (hour == 12) {
+            logger.info("SolarAnalysis[" + deviceName + "]: FIRING 12h run");
             return runIntermediate("12h", sunsetEpoch);
         }
         return new JSONArray();
@@ -153,6 +172,14 @@ public class SolarAnalysis implements Task {
         double projectedMah  = Math.max(0, currentMah - avgCurrentMa * hoursToSunset);
         double projectedSoc  = projectedMah / BATTERY_CAPACITY_MAH * 100.0;
         boolean alert        = projectedSoc < LOW_BATTERY_ALERT_PCT;
+
+        logger.info("SolarAnalysis[" + deviceName + "] " + label
+                + ": currentSOC=" + String.format("%.1f", currentSoc) + "%"
+                + " currentMah=" + String.format("%.0f", currentMah)
+                + " avgI=" + String.format("%.1f", avgCurrentMa) + "mA"
+                + " hoursToSunset=" + String.format("%.1f", hoursToSunset)
+                + " projectedSOC=" + String.format("%.1f", projectedSoc) + "%"
+                + (alert ? "  ⚠ LOW BATTERY ALERT" : ""));
 
         JSONArray words = new JSONArray();
         words.put(deneWord("Solar " + label + " SOC",                    currentSoc,   "Double"));
@@ -213,6 +240,16 @@ public class SolarAnalysis implements Task {
         double socAtSunset  = computeCoulombSoc(sunsetEpoch);
         double mahAtSunset  = socAtSunset / 100.0 * BATTERY_CAPACITY_MAH;
         boolean anchorReliable = bestAnchor != null;
+
+        logger.info("SolarAnalysis[" + deviceName + "] sunset:"
+                + " active=" + activePct + "% cloudy=" + cloudyPct + "% sleep=" + sleepPct + "%"
+                + " luxCorr=" + luxCorr
+                + " activeLux=" + String.format("%.0f", activeLuxAvg)
+                + " cloudyLux=" + String.format("%.0f", cloudyLuxAvg)
+                + " socAtSunset=" + socAtSunset + "%"
+                + " mAhAtSunset=" + String.format("%.0f", mahAtSunset)
+                + " anchorReliable=" + anchorReliable
+                + " daytimeRecords=" + dayLora.size());
 
         JSONArray words = new JSONArray();
         words.put(deneWord("Solar Active Pct",           activePct,      "Double"));

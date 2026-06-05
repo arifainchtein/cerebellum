@@ -3,11 +3,17 @@ package com.teleonome.cerebellum.graveyardshift;
 import com.luckycatlabs.sunrisesunset.SunriseSunsetCalculator;
 import com.luckycatlabs.sunrisesunset.dto.Location;
 import com.teleonome.cerebellum.Task;
+import com.teleonome.framework.TeleonomeConstants;
+
+import org.apache.log4j.Logger;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.text.SimpleDateFormat;
 import java.util.*;
+
+                                     
+
 
 /**
  * Stateful task: accumulates readings across pulses, then at sunset produces
@@ -40,6 +46,7 @@ public class GraveyardShift implements Task {
     // records with wakeTimeSec=255 belong to the same long wake session (WiFi upload).
     private static final int    WAKE_TIME_SEC_SATURATED      = 255;
 
+    private final Logger logger = Logger.getLogger(getClass());
     private final String deviceName;
 
     // Each entry: [timeSeconds, voltage (V), batteryCurrent (mA), sleepTime (s), wakeTimeSec]
@@ -72,10 +79,16 @@ public class GraveyardShift implements Task {
         double lon           = getDeneWordDouble(telepathon, "Configuration", "longitude");
         long   timeSeconds   = telepathon.optLong("Seconds Time", System.currentTimeMillis() / 1000);
 
-        if (voltage == 0 || lat == 0) return new JSONArray();
+        if (voltage == 0 || lat == 0) {
+            logger.debug("GraveyardShift[" + deviceName + "]: skipping — voltage=" + voltage + " lat=" + lat);
+            return new JSONArray();
+        }
 
         history.add(new double[]{timeSeconds, voltage, batteryCurrent, sleepSec, wakeTimeSec});
         if (history.size() > MAX_HISTORY) history.remove(0);
+        logger.debug("GraveyardShift[" + deviceName + "]: recorded V=" + voltage
+                + " I=" + batteryCurrent + "mA sleep=" + sleepSec + "s wake=" + wakeTimeSec
+                + "s  history=" + history.size() + " records");
 
         // Update the reliable anchor whenever voltage breaks above the flat LiFePO4 plateau.
         // This persists across days so a clear-sky noon calibrates cloudy-day evenings.
@@ -83,6 +96,8 @@ public class GraveyardShift implements Task {
             double anchorSoc = estimateSocPct(voltage);
             if (bestAnchor == null || anchorSoc > bestAnchor[1]) {
                 bestAnchor = new double[]{timeSeconds, anchorSoc};
+                logger.info("GraveyardShift[" + deviceName + "]: new reliable anchor "
+                        + voltage + "V = " + anchorSoc + "% SOC");
             }
         }
 
@@ -97,6 +112,10 @@ public class GraveyardShift implements Task {
         long sunsetEpoch  = sunsetCal.getTimeInMillis()  / 1000;
         long sunriseEpoch = sunriseCal.getTimeInMillis() / 1000;
 
+        logger.info("GraveyardShift[" + deviceName + "]: FIRING — history=" + history.size()
+                + " cycles=" + wakeCycleRepresentatives().size()
+                + " anchor=" + (bestAnchor != null ? bestAnchor[1] + "%" : "none (voltage fallback)"));
+
         // ── Voltage-based forecast ──────────────────────────────────────────
         double dischargeVPerHour = calcDischargeRate();
         if (sleepSec <= 30) sleepSec = 900;
@@ -110,9 +129,19 @@ public class GraveyardShift implements Task {
         double socVoltSunset    = estimateSocPct(voltageAtSunset);
         double socVoltSunrise   = estimateSocPct(voltageAtSunrise);
 
+        logger.info("GraveyardShift[" + deviceName + "]: voltage forecast — dischargeRate="
+                + String.format("%.4f", dischargeVPerHour) + "V/hr"
+                + " voltAtSunset=" + String.format("%.3f", voltageAtSunset) + "V"
+                + " socAtSunset=" + String.format("%.1f", socVoltSunset) + "%"
+                + " voltAtSunrise=" + String.format("%.3f", voltageAtSunrise) + "V"
+                + " socAtSunrise=" + String.format("%.1f", socVoltSunrise) + "%");
+
         // ── Coulomb-based SOC at sunset ─────────────────────────────────────
         double coulombSocAtSunset = computeCoulombSocAtSunset(sunsetEpoch);
         double coulombMahAtSunset = coulombSocAtSunset / 100.0 * BATTERY_CAPACITY_MAH;
+        logger.info("GraveyardShift[" + deviceName + "]: coulomb forecast — soc="
+                + coulombSocAtSunset + "% mAh=" + String.format("%.1f", coulombMahAtSunset)
+                + " anchorReliable=" + (bestAnchor != null));
 
         // TX cycles
         int txCycles = 0;
