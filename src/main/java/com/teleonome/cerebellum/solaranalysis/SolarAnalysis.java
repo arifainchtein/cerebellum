@@ -5,6 +5,8 @@ package com.teleonome.cerebellum.solaranalysis;
 import com.luckycatlabs.sunrisesunset.SunriseSunsetCalculator;
 import com.luckycatlabs.sunrisesunset.dto.Location;
 import com.teleonome.cerebellum.Task;
+import com.teleonome.framework.utils.Utils;
+
 import org.apache.log4j.Logger;
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -394,20 +396,32 @@ public class SolarAnalysis implements Task {
 
     private double getDeneWordDouble(JSONObject deneChain, String deneName, String wordName) {
         try {
+        	   logger.debug("line 408,deneName=" + deneName + " wordName=" + wordName);
             JSONArray denes = deneChain.getJSONArray("Denes");
+            logger.debug("line 410,denes=" + denes.length());
             for (int i = 0; i < denes.length(); i++) {
                 JSONObject dene = denes.getJSONObject(i);
+                logger.debug("line 413,dene=" + dene.getString("Name"));
                 if (deneName.equals(dene.getString("Name"))) {
                     JSONArray words = dene.getJSONArray("DeneWords");
+                    logger.debug("line 416,words=" + words.length());
                     for (int j = 0; j < words.length(); j++) {
                         JSONObject word = words.getJSONObject(j);
+                        logger.debug("line 419 words=" + word.getString("Name"));
                         if (wordName.equals(word.getString("Name"))) {
-                            return Double.parseDouble(word.getString("Value"));
+                        	
+                        	//double d=Double.parseDouble(word.getString("Value"));
+                        	double d=word.getDouble("Value");
+                        	logger.debug("line 421 returning=" + d);
+                            return d;
+                            
                         }
                     }
                 }
             }
-        } catch (Exception ignored) {}
+        } catch (Exception e) {
+        	logger.warn(Utils.getStringException(e));
+        }
         return 0.0;
     }
 
