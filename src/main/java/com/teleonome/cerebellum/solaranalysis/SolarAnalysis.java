@@ -79,7 +79,7 @@ public class SolarAnalysis implements Task {
         double lat            = getDeneWordDouble(telepathon, "Configuration", "Latitude");
         double lon            = getDeneWordDouble(telepathon, "Configuration", "longitude");
         long   timeSeconds    = telepathon.optLong("Seconds Time", System.currentTimeMillis() / 1000);
-
+        logger.debug("Starting to process Solar Analysis");
         if (lat == 0) {
             logger.debug("SolarAnalysis[" + deviceName + "]: skipping — lat=0");
             return new JSONArray();

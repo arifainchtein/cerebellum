@@ -188,7 +188,7 @@ public class Cerebellum {
                          String className = getDeneWordString(taskDene,
                                  TeleonomeConstants.DENEWORD_CEREBELLUM_TASK_TRUE_EXPRESSION);
                          Task task = getOrCreateTask(className, telepathonType);
-                         logger.debug("line 173 className= " +className + " task is null=" + (task == null));
+                         logger.debug("line 191 className= " +className + " task is null=" + (task == null));
 
                          if (task == null) continue;
 
@@ -196,7 +196,7 @@ public class Cerebellum {
                          long startTime = System.currentTimeMillis();
                          JSONArray words = task.process(telepathon);
                          long endTime = System.currentTimeMillis();
-
+                         logger.debug("line 199 words= " +words);
                          if (words.length() == 0) continue;
 
                          // Gate 1+2: match execution time slot AND check it hasn't run today
@@ -205,14 +205,14 @@ public class Cerebellum {
                          String frequency = getDeneWordString(taskDene,
                                  TeleonomeConstants.DENEWORD_CEREBELLUM_EXECUTION_FREQUENCY);
                          String matchedSlot = matchExecutionSlot(executionTime, frequency, telepathon);
-                         logger.debug("line 189 executionTime= " +executionTime + " frequency=" + frequency + " matchedSlot=" + matchedSlot);
+                         logger.debug("line 208 executionTime= " +executionTime + " frequency=" + frequency + " matchedSlot=" + matchedSlot);
                          if (matchedSlot == null) {
                              logger.debug("No execution slot matched for "
                                      + task.getName() + "/" + telepathonType);
                              continue;
                          }
                          String trackingKey = className + ":" + telepathonType + ":" + matchedSlot;
-                         logger.debug("line 196 trackingKey= " +trackingKey);
+                         logger.debug("line 215 trackingKey= " +trackingKey);
                          
                          if (!isFrequencyAllowed(trackingKey)) {
                              logger.debug("Slot '" + matchedSlot + "' already ran today for "

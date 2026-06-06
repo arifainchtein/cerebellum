@@ -78,7 +78,7 @@ public class GraveyardShift implements Task {
         double lat           = getDeneWordDouble(telepathon, "Configuration", "Latitude");
         double lon           = getDeneWordDouble(telepathon, "Configuration", "longitude");
         long   timeSeconds   = telepathon.optLong("Seconds Time", System.currentTimeMillis() / 1000);
-
+        logger.debug("Starting to process GraveyardShift");
         if (voltage == 0 || lat == 0) {
             logger.debug("GraveyardShift[" + deviceName + "]: skipping — voltage=" + voltage + " lat=" + lat);
             return new JSONArray();
