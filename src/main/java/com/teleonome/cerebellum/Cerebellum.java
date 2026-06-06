@@ -164,7 +164,7 @@ public class Cerebellum {
                     	
                     	 telepathonName = telepathon.getString("Name");
                     	 logger.debug("line 156, telepathon=" +telepathonName);
-                    	 identity = new Identity(teleonomeName,TeleonomeConstants.NUCLEI_TELEPATHONS, telepathonName,TeleonomeConstants.TELEPATHON_DENE_PURPOSE,"Device Type Id"   );;
+                    	 identity = new Identity(teleonomeName,TeleonomeConstants.NUCLEI_TELEPATHONS, telepathonName,TeleonomeConstants.TELEPATHON_DENE_CONFIGURATION,"Device Type Id"   );;
                     	logger.debug("line 168, identity=" + identity.toString());
                     	 telepathonType = (String) DenomeUtils.getDeneWordByIdentity(pulse, identity, TeleonomeConstants.DENEWORD_VALUE_ATTRIBUTE);
                     	 logger.debug("line 169, telepathonType=" +telepathonType); 
