@@ -4,6 +4,7 @@ import com.luckycatlabs.sunrisesunset.SunriseSunsetCalculator;
 import com.luckycatlabs.sunrisesunset.dto.Location;
 import com.teleonome.cerebellum.Task;
 import com.teleonome.framework.TeleonomeConstants;
+import com.teleonome.framework.utils.Utils;
 
 import org.apache.log4j.Logger;
 import org.json.JSONArray;
@@ -418,15 +419,18 @@ public class GraveyardShift implements Task {
                         JSONObject word = words.getJSONObject(j);
                         logger.debug("line 419 words=" + word.getString("Name"));
                         if (wordName.equals(word.getString("Name"))) {
+                        	
                         	double d=Double.parseDouble(word.getString("Value"));
-                        	   logger.debug("line 421 returning=" + d);
+                        	logger.debug("line 421 returning=" + d);
                             return d;
                             
                         }
                     }
                 }
             }
-        } catch (Exception ignored) {}
+        } catch (Exception e) {
+        	logger.warn(Utils.getStringException(e));
+        }
         return 0.0;
     }
 
