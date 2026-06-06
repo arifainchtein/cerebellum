@@ -179,7 +179,7 @@ public class Cerebellum {
                          // Evaluate JEXL Expression with condition pointer bindings
                          String expression = getDeneWordString(taskDene,
                                  TeleonomeConstants.DENEWORD_CEREBELLUM_EXPRESSION);
-                         if (!evaluateExpression(expression, taskDene, pulse)) {
+                         if (!evaluateExpression(telepathonName,expression, taskDene, pulse)) {
                              logger.debug("Expression '" + expression + "' false for " + telepathonType);
                              continue;
                          }
@@ -324,7 +324,9 @@ public class Cerebellum {
 
     // ── Expression evaluation ─────────────────────────────────────────────────
 
-    private boolean evaluateExpression(String expression, JSONObject taskDene, JSONObject pulse) {
+    private boolean evaluateExpression(String telepathonName, String expression, JSONObject taskDene, JSONObject pulse) {
+    	logger.debug("line 328,expression=" + expression + " taskDene=" + taskDene.toString() );
+    	Identity identity;
         try {
             JexlContext context = new MapContext();
             JSONArray words = taskDene.getJSONArray("DeneWords");
@@ -333,8 +335,14 @@ public class Cerebellum {
                 if (TeleonomeConstants.DENEWORD_TYPE_CEREBELLUM_TASK_CONDITION_POINTER.equals(
                         word.optString(TeleonomeConstants.DENEWORD_DENEWORD_TYPE_ATTRIBUTE))) {
                     String varName  = word.getString(TeleonomeConstants.DENEWORD_NAME_ATTRIBUTE);
-                    String pointer  = word.getString(TeleonomeConstants.DENEWORD_VALUE_ATTRIBUTE);
-                    Object value    = resolvePointer(pulse, pointer);
+                    //
+                    // the value is just @Purpose:Using Solar Power" 
+                    String[] tokens  = word.getString(TeleonomeConstants.DENEWORD_VALUE_ATTRIBUTE).replace("@","").split(":");
+               	 identity = new Identity(teleonomeName,TeleonomeConstants.NUCLEI_TELEPATHONS, telepathonName,tokens[0],tokens[1]   );;
+                 
+                    Object value = DenomeUtils.getDeneWordByIdentity(pulse, identity, TeleonomeConstants.DENEWORD_VALUE_ATTRIBUTE);
+                	
+                    
                     if (value != null) context.set(varName, value);
                 }
             }
