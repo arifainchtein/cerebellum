@@ -342,7 +342,7 @@ public class Cerebellum {
                  
                     Object value = DenomeUtils.getDeneWordByIdentity(pulse, identity, TeleonomeConstants.DENEWORD_VALUE_ATTRIBUTE);
                 	
-                    
+                    logger.debug("line 345,varName=" + varName + " value=" + value );
                     if (value != null) context.set(varName, value);
                 }
             }
