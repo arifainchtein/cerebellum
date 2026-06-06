@@ -43,6 +43,9 @@ public class Cerebellum {
     private final Map<String, Task> taskRegistry       = new HashMap<>();
     // Epoch second of the last successful broadcast per task key.
     private final Map<String, Long> lastExecutionEpoch = new HashMap<>();
+    // Latest words from each task per device: deviceType → className → words.
+    // Persists across pulses so every broadcast carries the full picture.
+    private final Map<String, Map<String, JSONArray>> latestTaskWords = new LinkedHashMap<>();
 
 
     		
@@ -139,7 +142,7 @@ public class Cerebellum {
             taskDenes.sort(Comparator.comparingInt(d ->
                     getDeneWordInt(d, TeleonomeConstants.DENEWORD_CEREBELLUM_EVALUATION_POSITION)));
 
-            Map<String, JSONArray> deviceWords = new LinkedHashMap<>();
+            boolean anyNewResults = false;
 
             for (JSONObject taskDene : taskDenes) {
                 try {
@@ -163,15 +166,15 @@ public class Cerebellum {
                     	telepathon = telepathons.getJSONObject(j);
                     	
                     	 telepathonName = telepathon.getString("Name");
-                    	 logger.debug("line 156, telepathon=" +telepathonName);
+                    	// logger.debug("line 156, telepathon=" +telepathonName);
                     	 identity = new Identity(teleonomeName,TeleonomeConstants.NUCLEI_TELEPATHONS, telepathonName,TeleonomeConstants.TELEPATHON_DENE_CONFIGURATION,"Device Type Id"   );;
-                    	logger.debug("line 168, identity=" + identity.toString());
+                   // 	logger.debug("line 168, identity=" + identity.toString());
                     	 telepathonType = (String) DenomeUtils.getDeneWordByIdentity(pulse, identity, TeleonomeConstants.DENEWORD_VALUE_ATTRIBUTE);
-                    	 logger.debug("line 169, telepathonType=" +telepathonType); 
+                   // 	 logger.debug("line 169, telepathonType=" +telepathonType); 
                     	if (telepathonType == null) continue;
                     	
                          if(!taskTelepathonType.equals(telepathonType)) {
-                        	 logger.debug("line 173,skiping task for  telepathon=" +telepathonName);
+                       // 	 logger.debug("line 173,skiping task for  telepathon=" +telepathonName);
                         	 continue;
                          }
                          
@@ -229,21 +232,23 @@ public class Cerebellum {
                          words.put(timingDeneWord(task.getName() + " Duration",
                                  String.valueOf(endTime - startTime), "Integer"));
 
-                         // Accumulate into device bucket
-                         JSONArray bucket = deviceWords.computeIfAbsent(telepathonType,
-                                 k -> new JSONArray());
-                         for (int i = 0; i < words.length(); i++) bucket.put(words.get(i));
-
                          // If this task Dene declares an Annabelle action to activate,
                          // carry the pointer through to the cerebellumStatus so that
                          // updateCerebellumPurposeDene() can activate it generically.
                          String actionPointer = getDeneWordString(taskDene,
                                  TeleonomeConstants.DENEWORD_CEREBELLUM_ANNABELLE_ACTION_POINTER);
                          if (actionPointer != null && !actionPointer.isEmpty()) {
-                             bucket.put(timingDeneWord(
+                             words.put(timingDeneWord(
                                      TeleonomeConstants.DENEWORD_CEREBELLUM_ANNABELLE_ACTION_POINTER,
                                      actionPointer, "String"));
                          }
+
+                         // Store the latest snapshot for this task+device.
+                         // The broadcast always rebuilds from all stored snapshots so that
+                         // every device Dene contains the freshest words from every task.
+                         latestTaskWords.computeIfAbsent(telepathonType, k -> new LinkedHashMap<>())
+                                        .put(className, words);
+                         anyNewResults = true;
 
                          logger.info("Task " + task.getName() + " for " + telepathonType
                                  + " produced " + words.length() + " DeneWords in "
@@ -258,9 +263,17 @@ public class Cerebellum {
                 }
             }
 
-            if (!deviceWords.isEmpty()) {
-                JSONObject deneChain = buildCerebellumDeneChain(deviceWords);
-                broadcastAnalysis(deneChain);
+            if (anyNewResults && !latestTaskWords.isEmpty()) {
+                // Build the complete picture: merge latest words from every task for each device.
+                Map<String, JSONArray> deviceWords = new LinkedHashMap<>();
+                for (Map.Entry<String, Map<String, JSONArray>> deviceEntry : latestTaskWords.entrySet()) {
+                    JSONArray bucket = new JSONArray();
+                    for (JSONArray taskWords : deviceEntry.getValue().values()) {
+                        for (int i = 0; i < taskWords.length(); i++) bucket.put(taskWords.get(i));
+                    }
+                    deviceWords.put(deviceEntry.getKey(), bucket);
+                }
+                broadcastAnalysis(buildCerebellumDeneChain(deviceWords));
             }
 
         } catch (Exception e) {

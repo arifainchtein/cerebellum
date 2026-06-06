@@ -131,7 +131,7 @@ public class SolarAnalysis implements Task {
                 + " nearSunset=" + nearSunset + " cycles=" + wakeCycleRepresentatives().size());
 
         if (nearSunset) {
-            logger.info("SolarAnalysis[" + deviceName + "]: FIRING sunset run");
+            logger.info("line 134 SolarAnalysis[" + deviceName + "]: FIRING sunset run");
             return runSunset(sunriseEpoch, sunsetEpoch);
         } else if (hour == 15) {
             logger.info("SolarAnalysis[" + deviceName + "]: FIRING 15h run");
