@@ -125,7 +125,7 @@ public class SolarAnalysis implements Task {
         // Determine run mode from current hour (Cerebellum already gated by slot)
         int hour = today.get(Calendar.HOUR_OF_DAY);
         long nowEpoch = System.currentTimeMillis() / 1000;
-        boolean nearSunset = Math.abs(nowEpoch - sunsetEpoch) <= 1800;
+        boolean nearSunset = true;//Math.abs(nowEpoch - sunsetEpoch) <= 1800;
 
         logger.debug("SolarAnalysis[" + deviceName + "]: hour=" + hour
                 + " nearSunset=" + nearSunset + " cycles=" + wakeCycleRepresentatives().size());
