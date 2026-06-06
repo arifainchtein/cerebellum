@@ -71,6 +71,7 @@ public class GraveyardShift implements Task {
 
     @Override
     public JSONArray process(JSONObject telepathon) throws Exception {
+    	logger.debug("line 74,telepathon=" + telepathon.toString(4) );
         double voltage        = getDeneWordDouble(telepathon, "Purpose", "Battery Voltage");
         double batteryCurrent = getDeneWordDouble(telepathon, "Purpose", "Battery Current");
         int    sleepSec       = (int) getDeneWordDouble(telepathon, "Purpose", "Sleep Time");
