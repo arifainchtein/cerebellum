@@ -420,7 +420,8 @@ public class GraveyardShift implements Task {
                         logger.debug("line 419 words=" + word.getString("Name"));
                         if (wordName.equals(word.getString("Name"))) {
                         	
-                        	double d=Double.parseDouble(word.getString("Value"));
+                        	//double d=Double.parseDouble(word.getString("Value"));
+                        	double d=word.getDouble("Value");
                         	logger.debug("line 421 returning=" + d);
                             return d;
                             
