@@ -405,9 +405,9 @@ public class GraveyardShift implements Task {
 
     private double getDeneWordDouble(JSONObject deneChain, String deneName, String wordName) {
         try {
-        	
+        	   logger.debug("line 408,deneName=" + deneName + " wordName=" + wordName);
             JSONArray denes = deneChain.getJSONArray("Denes");
-            logger.debug("line 408,denes=" + denes.length());
+            logger.debug("line 410,denes=" + denes.length());
             for (int i = 0; i < denes.length(); i++) {
                 JSONObject dene = denes.getJSONObject(i);
                 logger.debug("line 413,dene=" + dene.getString("Name"));
@@ -418,7 +418,10 @@ public class GraveyardShift implements Task {
                         JSONObject word = words.getJSONObject(j);
                         logger.debug("line 419 words=" + word.getString("Name"));
                         if (wordName.equals(word.getString("Name"))) {
-                            return Double.parseDouble(word.getString("Value"));
+                        	double d=Double.parseDouble(word.getString("Value"));
+                        	   logger.debug("line 421 returning=" + d);
+                            return d;
+                            
                         }
                     }
                 }
