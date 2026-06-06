@@ -95,7 +95,7 @@ public class SolarAnalysis implements Task {
         midnight.set(Calendar.MILLISECOND, 0);
         long midnightEpoch = midnight.getTimeInMillis() / 1000;
         if (midnightEpoch > todayMidnight) {
-            logger.info("SolarAnalysis[" + deviceName + "]: midnight reset — clearing " + history.size() + " records");
+            logger.info("line 98 SolarAnalysis[" + deviceName + "]: midnight reset — clearing " + history.size() + " records");
             history.clear();
             todayMidnight = midnightEpoch;
         }
@@ -110,7 +110,7 @@ public class SolarAnalysis implements Task {
             double anchorSoc = estimateSocPct(voltage);
             if (bestAnchor == null || anchorSoc > bestAnchor[1]) {
                 bestAnchor = new double[]{timeSeconds, anchorSoc};
-                logger.info("SolarAnalysis[" + deviceName + "]: new reliable anchor "
+                logger.info("ine 113 SolarAnalysis[" + deviceName + "]: new reliable anchor "
                         + voltage + "V = " + anchorSoc + "% SOC");
             }
         }
@@ -127,7 +127,7 @@ public class SolarAnalysis implements Task {
         long nowEpoch = System.currentTimeMillis() / 1000;
         boolean nearSunset = true;//Math.abs(nowEpoch - sunsetEpoch) <= 1800;
 
-        logger.debug("SolarAnalysis[" + deviceName + "]: hour=" + hour
+        logger.debug("line 130 SolarAnalysis[" + deviceName + "]: hour=" + hour
                 + " nearSunset=" + nearSunset + " cycles=" + wakeCycleRepresentatives().size());
 
         if (nearSunset) {
@@ -174,7 +174,6 @@ public class SolarAnalysis implements Task {
         double projectedMah  = Math.max(0, currentMah - avgCurrentMa * hoursToSunset);
         double projectedSoc  = projectedMah / BATTERY_CAPACITY_MAH * 100.0;
         boolean alert        = projectedSoc < LOW_BATTERY_ALERT_PCT;
-
         logger.info("SolarAnalysis[" + deviceName + "] " + label
                 + ": currentSOC=" + String.format("%.1f", currentSoc) + "%"
                 + " currentMah=" + String.format("%.0f", currentMah)
@@ -199,9 +198,10 @@ public class SolarAnalysis implements Task {
         for (double[] r : wakeCycleRepresentatives()) {
             if (r[0] >= sunriseEpoch && r[0] <= sunsetEpoch) dayLora.add(r);
         }
+        logger.debug("line 201");
         if (dayLora.size() < 2) return new JSONArray();
         dayLora.sort(Comparator.comparingDouble(r -> r[0]));
-
+        logger.debug("line 204");
         // Operating mode time distribution
         Map<Integer, Long> secondsByStatus = new HashMap<>();
         long totalSeconds = 0;
@@ -217,7 +217,7 @@ public class SolarAnalysis implements Task {
             secondsByStatus.merge((int) last[4], finalGap, Long::sum);
             totalSeconds += finalGap;
         }
-
+        logger.debug("line 220");
         double activePct = pct(secondsByStatus.getOrDefault(STATUS_ACTIVE, 0L), totalSeconds);
         double cloudyPct = pct(secondsByStatus.getOrDefault(STATUS_CLOUDY, 0L), totalSeconds);
         double sleepPct  = pct(secondsByStatus.getOrDefault(STATUS_SLEEP,  0L), totalSeconds);
@@ -237,13 +237,13 @@ public class SolarAnalysis implements Task {
         double luxCorr     = pearson(luxPairs);
         double activeLuxAvg = activeLuxCount > 0 ? activeLuxSum / activeLuxCount : 0;
         double cloudyLuxAvg = cloudyLuxCount > 0 ? cloudyLuxSum / cloudyLuxCount : 0;
-
+        logger.debug("line 241");
         // Coulomb SOC at sunset — canonical value for GraveyardShift handoff
         double socAtSunset  = computeCoulombSoc(sunsetEpoch);
         double mahAtSunset  = socAtSunset / 100.0 * BATTERY_CAPACITY_MAH;
         boolean anchorReliable = bestAnchor != null;
 
-        logger.info("SolarAnalysis[" + deviceName + "] sunset:"
+        logger.info("line 246 SolarAnalysis[" + deviceName + "] sunset:"
                 + " active=" + activePct + "% cloudy=" + cloudyPct + "% sleep=" + sleepPct + "%"
                 + " luxCorr=" + luxCorr
                 + " activeLux=" + String.format("%.0f", activeLuxAvg)
