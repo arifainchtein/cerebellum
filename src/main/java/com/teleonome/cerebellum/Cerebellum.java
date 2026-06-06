@@ -5,6 +5,9 @@ import com.luckycatlabs.sunrisesunset.dto.Location;
 import com.teleonome.framework.TeleonomeConstants;
 import com.teleonome.framework.persistence.PostgresqlPersistenceManager;
 import com.teleonome.framework.utils.Utils;
+import com.teleonome.framework.denome.DenomeUtils;
+import com.teleonome.framework.denome.Identity;
+
 import org.apache.commons.io.FileUtils;
 import org.apache.commons.jexl2.*;
 import org.apache.log4j.Logger;
@@ -146,89 +149,107 @@ public class Cerebellum {
                     }
                     logger.debug("line 147, taskDene=" + taskDene.toString(4));
                     // Get device name from the typed DeneWord
-                    String telepathonType = getDeneWordByType(taskDene,
+                   
+                    String taskTelepathonType = getDeneWordByType(taskDene,
                             TeleonomeConstants.DENEWORD_TYPE_CEREBELLUM_TELEPATHON_TYPE);
-                    if (telepathonType == null) continue;
-
+                    logger.debug("line 151, telepathonType=" +taskTelepathonType);
                     // Extract the device's current telepathon from the pulse
-                    JSONObject telepathon = extractTelepathon(pulse, telepathonType);
-                    if (telepathon == null) {
-                        logger.debug("No telepathon found for device type: " + telepathonType);
-                        continue;
+                    JSONArray telepathons = extractTelepathons(pulse);
+                    JSONObject telepathon;
+                    String telepathonType=null;
+                    String telepathonName;
+                    Identity identity;
+                    for(int j=0;j<telepathons.length();j++) {
+                    	telepathon = telepathons.getJSONObject(j);
+                    	
+                    	 telepathonName = denome.getString("Name");
+                    	 logger.debug("line 156, telepathon=" +telepathonName);
+                    	 identity = new Identity(teleonomeName,TeleonomeConstants.NUCLEI_TELEPATHONS, telepathonName,TeleonomeConstants.TELEPATHON_DENE_PURPOSE,"Device Type Id"   );;
+                    	telepathonType = (String) DenomeUtils.getDeneWordByIdentity(pulse, identity, TeleonomeConstants.DENEWORD_VALUE_ATTRIBUTE);
+                    	 logger.debug("line 169, telepathonType=" +telepathonType); 
+                    	if (telepathonType == null) continue;
+                    	
+                         if(!taskTelepathonType.equals(telepathonType)) {
+                        	 logger.debug("line 173,skiping task for  telepathon=" +telepathonName);
+                        	 continue;
+                         }
+                         
+                         logger.debug("about to evaluate ");
+                         // Evaluate JEXL Expression with condition pointer bindings
+                         String expression = getDeneWordString(taskDene,
+                                 TeleonomeConstants.DENEWORD_CEREBELLUM_EXPRESSION);
+                         if (!evaluateExpression(expression, taskDene, pulse)) {
+                             logger.debug("Expression '" + expression + "' false for " + telepathonType);
+                             continue;
+                         }
+
+                         // Get or create the task instance
+                         String className = getDeneWordString(taskDene,
+                                 TeleonomeConstants.DENEWORD_CEREBELLUM_TASK_TRUE_EXPRESSION);
+                         Task task = getOrCreateTask(className, telepathonType);
+                         logger.debug("line 173 className= " +className + " task is null=" + (task == null));
+
+                         if (task == null) continue;
+
+                         // Execute — task returns empty array if not yet time to publish results
+                         long startTime = System.currentTimeMillis();
+                         JSONArray words = task.process(telepathon);
+                         long endTime = System.currentTimeMillis();
+
+                         if (words.length() == 0) continue;
+
+                         // Gate 1+2: match execution time slot AND check it hasn't run today
+                         String executionTime = getDeneWordString(taskDene,
+                                 TeleonomeConstants.DENEWORD_CEREBELLUM_EXECUTION_TIME);
+                         String frequency = getDeneWordString(taskDene,
+                                 TeleonomeConstants.DENEWORD_CEREBELLUM_EXECUTION_FREQUENCY);
+                         String matchedSlot = matchExecutionSlot(executionTime, frequency, telepathon);
+                         logger.debug("line 189 executionTime= " +executionTime + " frequency=" + frequency + " matchedSlot=" + matchedSlot);
+                         if (matchedSlot == null) {
+                             logger.debug("No execution slot matched for "
+                                     + task.getName() + "/" + telepathonType);
+                             continue;
+                         }
+                         String trackingKey = className + ":" + telepathonType + ":" + matchedSlot;
+                         logger.debug("line 196 trackingKey= " +trackingKey);
+                         
+                         if (!isFrequencyAllowed(trackingKey)) {
+                             logger.debug("Slot '" + matchedSlot + "' already ran today for "
+                                     + task.getName() + "/" + telepathonType);
+                             continue;
+                         }
+
+                         // Record this broadcast
+                         lastExecutionEpoch.put(trackingKey, endTime / 1000);
+
+                         // Append mandatory timing DeneWords
+                         words.put(timingDeneWord(task.getName() + " Execution Time",
+                                 String.valueOf(endTime), "Long"));
+                         words.put(timingDeneWord(task.getName() + " Duration",
+                                 String.valueOf(endTime - startTime), "Integer"));
+
+                         // Accumulate into device bucket
+                         JSONArray bucket = deviceWords.computeIfAbsent(telepathonType,
+                                 k -> new JSONArray());
+                         for (int i = 0; i < words.length(); i++) bucket.put(words.get(i));
+
+                         // If this task Dene declares an Annabelle action to activate,
+                         // carry the pointer through to the cerebellumStatus so that
+                         // updateCerebellumPurposeDene() can activate it generically.
+                         String actionPointer = getDeneWordString(taskDene,
+                                 TeleonomeConstants.DENEWORD_CEREBELLUM_ANNABELLE_ACTION_POINTER);
+                         if (actionPointer != null && !actionPointer.isEmpty()) {
+                             bucket.put(timingDeneWord(
+                                     TeleonomeConstants.DENEWORD_CEREBELLUM_ANNABELLE_ACTION_POINTER,
+                                     actionPointer, "String"));
+                         }
+
+                         logger.info("Task " + task.getName() + " for " + telepathonType
+                                 + " produced " + words.length() + " DeneWords in "
+                                 + (endTime - startTime) + "ms");
                     }
-                    logger.debug("about to evaluate ");
-                    // Evaluate JEXL Expression with condition pointer bindings
-                    String expression = getDeneWordString(taskDene,
-                            TeleonomeConstants.DENEWORD_CEREBELLUM_EXPRESSION);
-                    if (!evaluateExpression(expression, taskDene, pulse)) {
-                        logger.debug("Expression '" + expression + "' false for " + telepathonType);
-                        continue;
-                    }
-
-                    // Get or create the task instance
-                    String className = getDeneWordString(taskDene,
-                            TeleonomeConstants.DENEWORD_CEREBELLUM_TASK_TRUE_EXPRESSION);
-                    Task task = getOrCreateTask(className, telepathonType);
-                    logger.debug("line 173 className= " +className + " task is null=" + (task == null));
-
-                    if (task == null) continue;
-
-                    // Execute — task returns empty array if not yet time to publish results
-                    long startTime = System.currentTimeMillis();
-                    JSONArray words = task.process(telepathon);
-                    long endTime = System.currentTimeMillis();
-
-                    if (words.length() == 0) continue;
-
-                    // Gate 1+2: match execution time slot AND check it hasn't run today
-                    String executionTime = getDeneWordString(taskDene,
-                            TeleonomeConstants.DENEWORD_CEREBELLUM_EXECUTION_TIME);
-                    String frequency = getDeneWordString(taskDene,
-                            TeleonomeConstants.DENEWORD_CEREBELLUM_EXECUTION_FREQUENCY);
-                    String matchedSlot = matchExecutionSlot(executionTime, frequency, telepathon);
-                    logger.debug("line 189 executionTime= " +executionTime + " frequency=" + frequency + " matchedSlot=" + matchedSlot);
-                    if (matchedSlot == null) {
-                        logger.debug("No execution slot matched for "
-                                + task.getName() + "/" + telepathonType);
-                        continue;
-                    }
-                    String trackingKey = className + ":" + telepathonType + ":" + matchedSlot;
-                    logger.debug("line 196 trackingKey= " +trackingKey);
+                   
                     
-                    if (!isFrequencyAllowed(trackingKey)) {
-                        logger.debug("Slot '" + matchedSlot + "' already ran today for "
-                                + task.getName() + "/" + telepathonType);
-                        continue;
-                    }
-
-                    // Record this broadcast
-                    lastExecutionEpoch.put(trackingKey, endTime / 1000);
-
-                    // Append mandatory timing DeneWords
-                    words.put(timingDeneWord(task.getName() + " Execution Time",
-                            String.valueOf(endTime), "Long"));
-                    words.put(timingDeneWord(task.getName() + " Duration",
-                            String.valueOf(endTime - startTime), "Integer"));
-
-                    // Accumulate into device bucket
-                    JSONArray bucket = deviceWords.computeIfAbsent(telepathonType,
-                            k -> new JSONArray());
-                    for (int i = 0; i < words.length(); i++) bucket.put(words.get(i));
-
-                    // If this task Dene declares an Annabelle action to activate,
-                    // carry the pointer through to the cerebellumStatus so that
-                    // updateCerebellumPurposeDene() can activate it generically.
-                    String actionPointer = getDeneWordString(taskDene,
-                            TeleonomeConstants.DENEWORD_CEREBELLUM_ANNABELLE_ACTION_POINTER);
-                    if (actionPointer != null && !actionPointer.isEmpty()) {
-                        bucket.put(timingDeneWord(
-                                TeleonomeConstants.DENEWORD_CEREBELLUM_ANNABELLE_ACTION_POINTER,
-                                actionPointer, "String"));
-                    }
-
-                    logger.info("Task " + task.getName() + " for " + telepathonType
-                            + " produced " + words.length() + " DeneWords in "
-                            + (endTime - startTime) + "ms");
 
                 } catch (Exception e) {
                     logger.warn("Task evaluation error: " + Utils.getStringException(e));
@@ -272,6 +293,18 @@ public class Cerebellum {
         return result;
     }
 
+    private JSONArray extractTelepathons(JSONObject pulse) {
+        try {
+            JSONArray nuclei = pulse.getJSONObject("Denome").getJSONArray("Nuclei");
+            for (int i = 0; i < nuclei.length(); i++) {
+                JSONObject nucleus = nuclei.getJSONObject(i);
+                if (!TeleonomeConstants.NUCLEI_TELEPATHONS.equals(nucleus.getString("Name"))) continue;
+                return nucleus.getJSONArray("DeneChains");
+            }
+        } catch (Exception ignored) {}
+        return null;
+    }
+    
     private JSONObject extractTelepathon(JSONObject pulse, String deviceName) {
         try {
             JSONArray nuclei = pulse.getJSONObject("Denome").getJSONArray("Nuclei");
