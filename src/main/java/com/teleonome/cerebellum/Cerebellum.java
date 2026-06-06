@@ -162,7 +162,7 @@ public class Cerebellum {
                     for(int j=0;j<telepathons.length();j++) {
                     	telepathon = telepathons.getJSONObject(j);
                     	
-                    	 telepathonName = denome.getString("Name");
+                    	 telepathonName = telepathon.getString("Name");
                     	 logger.debug("line 156, telepathon=" +telepathonName);
                     	 identity = new Identity(teleonomeName,TeleonomeConstants.NUCLEI_TELEPATHONS, telepathonName,TeleonomeConstants.TELEPATHON_DENE_PURPOSE,"Device Type Id"   );;
                     	telepathonType = (String) DenomeUtils.getDeneWordByIdentity(pulse, identity, TeleonomeConstants.DENEWORD_VALUE_ATTRIBUTE);
