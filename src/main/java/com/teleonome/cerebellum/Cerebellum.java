@@ -248,6 +248,7 @@ public class Cerebellum {
                          logger.info("Task " + task.getName() + " for " + telepathonType
                                  + " produced " + words.length() + " DeneWords in "
                                  + (endTime - startTime) + "ms");
+                         logger.debug(words.toString(4) );
                     }
                    
                     
