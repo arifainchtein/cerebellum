@@ -246,11 +246,11 @@ public class Cerebellum {
                          // Store the latest snapshot for this task+device.
                          // The broadcast always rebuilds from all stored snapshots so that
                          // every device Dene contains the freshest words from every task.
-                         latestTaskWords.computeIfAbsent(telepathonType, k -> new LinkedHashMap<>())
+                         latestTaskWords.computeIfAbsent(telepathonName, k -> new LinkedHashMap<>())
                                         .put(className, words);
                          anyNewResults = true;
 
-                         logger.info("Task " + task.getName() + " for " + telepathonType
+                         logger.info("Task " + task.getName() + " for " + telepathonName
                                  + " produced " + words.length() + " DeneWords in "
                                  + (endTime - startTime) + "ms");
                          logger.debug(words.toString(4) );
