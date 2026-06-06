@@ -204,7 +204,7 @@ public class Cerebellum {
                                  TeleonomeConstants.DENEWORD_CEREBELLUM_EXECUTION_TIME);
                          String frequency = getDeneWordString(taskDene,
                                  TeleonomeConstants.DENEWORD_CEREBELLUM_EXECUTION_FREQUENCY);
-                         String matchedSlot = matchExecutionSlot(executionTime, frequency, telepathon);
+                         String matchedSlot = TeleonomeConstants.DENEWORD_CEREBELLUM_EXECUTION_TIME_SUNSET;// matchExecutionSlot(executionTime, frequency, telepathon);
                          logger.debug("line 208 executionTime= " +executionTime + " frequency=" + frequency + " matchedSlot=" + matchedSlot);
                          if (matchedSlot == null) {
                              logger.debug("No execution slot matched for "
@@ -214,7 +214,7 @@ public class Cerebellum {
                          String trackingKey = className + ":" + telepathonType + ":" + matchedSlot;
                          logger.debug("line 215 trackingKey= " +trackingKey);
                          
-                         if (!isFrequencyAllowed(trackingKey)) {
+                        if(false) {// if (!isFrequencyAllowed(trackingKey)) {
                              logger.debug("Slot '" + matchedSlot + "' already ran today for "
                                      + task.getName() + "/" + telepathonType);
                              continue;
