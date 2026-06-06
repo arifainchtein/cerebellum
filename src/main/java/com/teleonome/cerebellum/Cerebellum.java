@@ -324,6 +324,16 @@ public class Cerebellum {
 
     // ── Expression evaluation ─────────────────────────────────────────────────
 
+    private Object coerceJexlValue(Object value) {
+        if (!(value instanceof String)) return value;
+        String s = (String) value;
+        if ("true".equalsIgnoreCase(s))  return Boolean.TRUE;
+        if ("false".equalsIgnoreCase(s)) return Boolean.FALSE;
+        try { return Double.parseDouble(s); } catch (NumberFormatException ignored) {}
+        return s;
+    }
+
+
     private boolean evaluateExpression(String telepathonName, String expression, JSONObject taskDene, JSONObject pulse) {
     	logger.debug("line 328,expression=" + expression + " taskDene=" + taskDene.toString() );
     	Identity identity;
@@ -343,7 +353,7 @@ public class Cerebellum {
                     Object value = DenomeUtils.getDeneWordByIdentity(pulse, identity, TeleonomeConstants.DENEWORD_VALUE_ATTRIBUTE);
                 	
                     logger.debug("line 345,varName=" + varName + " value=" + value );
-                    if (value != null) context.set(varName, value);
+                    if (value != null) context.set(varName, coerceJexlValue(value));
                 }
             }
             Expression expr = jexl.createExpression(expression);
