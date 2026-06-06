@@ -195,6 +195,7 @@ public class SolarAnalysis implements Task {
     private JSONArray runSunset(long sunriseEpoch, long sunsetEpoch) {
         // Use cycle representatives for mode analysis (one entry per wake session)
         List<double[]> dayLora = new ArrayList<>();
+        logger.debug("line 201");
         for (double[] r : wakeCycleRepresentatives()) {
             if (r[0] >= sunriseEpoch && r[0] <= sunsetEpoch) dayLora.add(r);
         }
@@ -308,12 +309,13 @@ public class SolarAnalysis implements Task {
      * When it resets (curr <= prev), a new wake cycle has started.
      */
     private List<double[]> wakeCycleRepresentatives() {
+    	logger.debug("line 312 history.size()=" + history.size());
         if (history.isEmpty()) return new ArrayList<>();
 
         boolean newFirmware = history.stream().anyMatch(r -> r[6] > 0);
         List<double[]> result = new ArrayList<>();
         int cycleStart = 0;
-
+     
         for (int i = 1; i <= history.size(); i++) {
             boolean endOfCycle;
             if (i == history.size()) {
@@ -325,10 +327,11 @@ public class SolarAnalysis implements Task {
                 double currWake = history.get(i)[6];
                 double dt       = history.get(i)[0] - history.get(i - 1)[0];
                 endOfCycle = currWake < history.get(i - 1)[6] || dt > currWake + 30;
+                logger.debug("line 330,cv= " + endOfCycle);
             } else {
                 endOfCycle = (history.get(i)[0] - history.get(i - 1)[0]) >= MIN_LORA_INTERVAL_SECONDS;
             }
-
+            logger.debug("line 334,endcuycle= " + endOfCycle);
             if (endOfCycle) {
                 double[] last = history.get(i - 1);
                 double sumCurrent = 0, maxWake = 0, maxSleep = 0;
@@ -345,6 +348,7 @@ public class SolarAnalysis implements Task {
                 cycleStart = i;
             }
         }
+        logger.debug("line 351,result= " + result);
         return result;
     }
 
