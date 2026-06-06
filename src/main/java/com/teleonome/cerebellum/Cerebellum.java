@@ -144,7 +144,7 @@ public class Cerebellum {
                     if (!getDeneWordBoolean(taskDene, TeleonomeConstants.DENEWORD_CEREBELLUM_ACTIVE)) {
                         continue;
                     }
-
+                    logger.debug("line 147, taskDene=" + taskDene.toString(4));
                     // Get device name from the typed DeneWord
                     String telepathonType = getDeneWordByType(taskDene,
                             TeleonomeConstants.DENEWORD_TYPE_CEREBELLUM_TELEPATHON_TYPE);
@@ -153,7 +153,7 @@ public class Cerebellum {
                     // Extract the device's current telepathon from the pulse
                     JSONObject telepathon = extractTelepathon(pulse, telepathonType);
                     if (telepathon == null) {
-                        logger.debug("No telepathon found for device: " + telepathonType);
+                        logger.debug("No telepathon found for device type: " + telepathonType);
                         continue;
                     }
                     logger.debug("about to evaluate ");
