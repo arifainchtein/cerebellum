@@ -43,9 +43,6 @@ public class Cerebellum {
     private final Map<String, Task> taskRegistry       = new HashMap<>();
     // Epoch second of the last successful broadcast per task key.
     private final Map<String, Long> lastExecutionEpoch = new HashMap<>();
-    // Latest words from each task per device: deviceType → className → words.
-    // Persists across pulses so every broadcast carries the full picture.
-    private final Map<String, Map<String, JSONArray>> latestTaskWords = new LinkedHashMap<>();
 
 
     		
@@ -142,7 +139,7 @@ public class Cerebellum {
             taskDenes.sort(Comparator.comparingInt(d ->
                     getDeneWordInt(d, TeleonomeConstants.DENEWORD_CEREBELLUM_EVALUATION_POSITION)));
 
-            boolean anyNewResults = false;
+            Map<String, JSONArray> deviceWords = new LinkedHashMap<>();
 
             for (JSONObject taskDene : taskDenes) {
                 try {
@@ -195,33 +192,30 @@ public class Cerebellum {
 
                          if (task == null) continue;
 
-                         // Execute — task returns empty array if not yet time to publish results
-                         long startTime = System.currentTimeMillis();
-                         JSONArray words = task.process(telepathon);
-                         long endTime = System.currentTimeMillis();
-                         logger.debug("line 199 words= " +words);
-                         if (words.length() == 0) continue;
-
-                         // Gate 1+2: match execution time slot AND check it hasn't run today
+                         // Match execution slot before calling the task so it receives the slot name
                          String executionTime = getDeneWordString(taskDene,
                                  TeleonomeConstants.DENEWORD_CEREBELLUM_EXECUTION_TIME);
                          String frequency = getDeneWordString(taskDene,
                                  TeleonomeConstants.DENEWORD_CEREBELLUM_EXECUTION_FREQUENCY);
-                         String matchedSlot = TeleonomeConstants.DENEWORD_CEREBELLUM_EXECUTION_TIME_SUNSET;// matchExecutionSlot(executionTime, frequency, telepathon);
-                         logger.debug("line 208 executionTime= " +executionTime + " frequency=" + frequency + " matchedSlot=" + matchedSlot);
+                         String matchedSlot = matchExecutionSlot(executionTime, frequency, telepathon);
+                         logger.debug("executionTime=" + executionTime + " frequency=" + frequency + " matchedSlot=" + matchedSlot);
                          if (matchedSlot == null) {
-                             logger.debug("No execution slot matched for "
-                                     + task.getName() + "/" + telepathonType);
+                             logger.debug("No execution slot matched for " + task.getName() + "/" + telepathonType);
                              continue;
                          }
                          String trackingKey = className + ":" + telepathonType + ":" + matchedSlot;
-                         logger.debug("line 215 trackingKey= " +trackingKey);
-                         
-                        if(false) {// if (!isFrequencyAllowed(trackingKey)) {
+                         if (false) { // if (!isFrequencyAllowed(trackingKey)) {
                              logger.debug("Slot '" + matchedSlot + "' already ran today for "
                                      + task.getName() + "/" + telepathonType);
                              continue;
                          }
+
+                         // Execute — task returns empty array if it has nothing ready yet
+                         long startTime = System.currentTimeMillis();
+                         JSONArray words = task.process(telepathon, matchedSlot);
+                         long endTime = System.currentTimeMillis();
+                         logger.debug("words=" + words);
+                         if (words.length() == 0) continue;
 
                          // Record this broadcast
                          lastExecutionEpoch.put(trackingKey, endTime / 1000);
@@ -243,12 +237,10 @@ public class Cerebellum {
                                      actionPointer, "String"));
                          }
 
-                         // Store the latest snapshot for this task+device.
-                         // The broadcast always rebuilds from all stored snapshots so that
-                         // every device Dene contains the freshest words from every task.
-                         latestTaskWords.computeIfAbsent(telepathonName, k -> new LinkedHashMap<>())
-                                        .put(className, words);
-                         anyNewResults = true;
+                         // Accumulate into per-device bucket for this pulse's broadcast
+                         JSONArray bucket = deviceWords.computeIfAbsent(telepathonType,
+                                 k -> new JSONArray());
+                         for (int i = 0; i < words.length(); i++) bucket.put(words.get(i));
 
                          logger.info("Task " + task.getName() + " for " + telepathonName
                                  + " produced " + words.length() + " DeneWords in "
@@ -263,16 +255,7 @@ public class Cerebellum {
                 }
             }
 
-            if (anyNewResults && !latestTaskWords.isEmpty()) {
-                // Build the complete picture: merge latest words from every task for each device.
-                Map<String, JSONArray> deviceWords = new LinkedHashMap<>();
-                for (Map.Entry<String, Map<String, JSONArray>> deviceEntry : latestTaskWords.entrySet()) {
-                    JSONArray bucket = new JSONArray();
-                    for (JSONArray taskWords : deviceEntry.getValue().values()) {
-                        for (int i = 0; i < taskWords.length(); i++) bucket.put(taskWords.get(i));
-                    }
-                    deviceWords.put(deviceEntry.getKey(), bucket);
-                }
+            if (!deviceWords.isEmpty()) {
                 broadcastAnalysis(buildCerebellumDeneChain(deviceWords));
             }
 

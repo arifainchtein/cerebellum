@@ -71,7 +71,7 @@ public class GraveyardShift implements Task {
     public String getDeviceName() { return deviceName; }
 
     @Override
-    public JSONArray process(JSONObject telepathon) throws Exception {
+    public JSONArray process(JSONObject telepathon, String matchedSlot) throws Exception {
     	logger.debug("line 74,telepathon=" + telepathon.toString(4) );
         double voltage        = getDeneWordDouble(telepathon, "Purpose", "Battery Voltage");
         double batteryCurrent = getDeneWordDouble(telepathon, "Purpose", "Battery Current");

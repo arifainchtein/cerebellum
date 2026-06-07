@@ -19,5 +19,5 @@ public interface Task {
      * non-empty JSONArray of DeneWords only when they have results ready to publish
      * (e.g. at sunset for time-triggered tasks), and an empty JSONArray otherwise.
      */
-    JSONArray process(JSONObject telepathon) throws Exception;
+    JSONArray process(JSONObject telepathon, String matchedSlot) throws Exception;
 }

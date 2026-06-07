@@ -49,6 +49,8 @@ public class SolarAnalysis implements Task {
     // Two consecutive records with wakeTimeSec=255 belong to the same WiFi session.
     private static final int    WAKE_TIME_SEC_SATURATED   = 255;
     private static final double LOW_BATTERY_ALERT_PCT     = 20.0; // warn if projected SOC < this
+    private static final double SOH_WARN_PCT              = 70.0; // alert when rolling-avg SOH below this
+    private static final int    SOH_MIN_SAMPLES           = 3;    // nights before alerting
 
     private final Logger logger = Logger.getLogger(getClass());
     private final String deviceName;
@@ -59,6 +61,13 @@ public class SolarAnalysis implements Task {
     private final List<double[]> history = new ArrayList<>();
     private long todayMidnight = 0;
     private double[] bestAnchor = null; // [timeSeconds, SOC%] — persists across days
+
+    // Battery health — persists across midnight resets
+    private double  sunsetOcvSoc        = 0;     // OCV SOC% at last sunset (voltage-based)
+    private long    lastProcessedEpoch  = 0;     // epoch of previous process() call
+    private double  overnightMah        = 0;     // coulomb-counted discharge since sunset
+    private boolean trackingOvernight   = false; // true between runSunset() and next sunrise
+    private final List<Double> capacityEstimates = new ArrayList<>(); // rolling SOH% history (max 30)
 
     public SolarAnalysis(String deviceName) {
         this.deviceName = deviceName;
@@ -71,7 +80,7 @@ public class SolarAnalysis implements Task {
     public String getDeviceName() { return deviceName; }
 
     @Override
-    public JSONArray process(JSONObject telepathon) throws Exception {
+    public JSONArray process(JSONObject telepathon, String matchedSlot) throws Exception {
         double voltage        = getDeneWordDouble(telepathon, "Purpose", "Battery Voltage");
         double batteryCurrent = getDeneWordDouble(telepathon, "Purpose", "Battery Current");
         int    sleepSec       = (int) getDeneWordDouble(telepathon, "Purpose", "Sleep Time");
@@ -122,25 +131,46 @@ public class SolarAnalysis implements Task {
         long sunriseEpoch = calc.getOfficialSunriseCalendarForDate(today).getTimeInMillis() / 1000;
         long sunsetEpoch  = calc.getOfficialSunsetCalendarForDate(today).getTimeInMillis()  / 1000;
 
-        // Determine run mode from current hour (Cerebellum already gated by slot)
-        int hour = today.get(Calendar.HOUR_OF_DAY);
-        long nowEpoch = System.currentTimeMillis() / 1000;
-        boolean nearSunset = true;//Math.abs(nowEpoch - sunsetEpoch) <= 1800;
-
-        logger.debug("line 130 SolarAnalysis[" + deviceName + "]: hour=" + hour
-                + " nearSunset=" + nearSunset + " cycles=" + wakeCycleRepresentatives().size());
-
-        if (nearSunset) {
-            logger.info("line 134 SolarAnalysis[" + deviceName + "]: FIRING sunset run");
-            return runSunset(sunriseEpoch, sunsetEpoch);
-        } else if (hour == 15) {
-            logger.info("SolarAnalysis[" + deviceName + "]: FIRING 15h run");
-            return runIntermediate("15h", sunsetEpoch);
-        } else if (hour == 12) {
-            logger.info("SolarAnalysis[" + deviceName + "]: FIRING 12h run");
-            return runIntermediate("12h", sunsetEpoch);
+        // Overnight battery-health tracking (survives midnight history reset)
+        if (trackingOvernight) {
+            if (timeSeconds >= sunriseEpoch) {
+                // First record at or after sunrise: finalize the overnight capacity estimate
+                finalizeOvernightCapacity(voltage);
+                trackingOvernight = false;
+            } else if (lastProcessedEpoch > 0 && timeSeconds > lastProcessedEpoch) {
+                // Still overnight: accumulate discharge using firmware wake/sleep split
+                double totalGap   = timeSeconds - lastProcessedEpoch;
+                double wakeHours  = Math.min(wakeTimeSec, totalGap) / 3600.0;
+                double sleepHours = Math.max(0, totalGap - wakeTimeSec) / 3600.0;
+                overnightMah += batteryCurrent * wakeHours + SLEEP_CURRENT_MA * sleepHours;
+            }
         }
-        return new JSONArray();
+        lastProcessedEpoch = timeSeconds;
+
+        // Dispatch based on the slot Cerebellum matched — no hardcoded hours here.
+        // Numeric slots ("12", "15", ...) → intermediate run labelled "<n>h".
+        // Named slots: "Sunset" → final analysis, "Sunrise" → reserved, others → intermediate.
+        logger.debug("SolarAnalysis[" + deviceName + "]: slot=" + matchedSlot
+                + " cycles=" + wakeCycleRepresentatives().size());
+
+        if ("Sunset".equalsIgnoreCase(matchedSlot)) {
+            logger.info("SolarAnalysis[" + deviceName + "]: FIRING sunset run");
+            return runSunset(sunriseEpoch, sunsetEpoch);
+        } else if ("Sunrise".equalsIgnoreCase(matchedSlot)) {
+            logger.debug("SolarAnalysis[" + deviceName + "]: Sunrise slot — no action defined");
+            return new JSONArray();
+        } else {
+            // Numeric hour or a named midday alias ("Noon", "12", "15", …)
+            String label;
+            try {
+                Integer.parseInt(matchedSlot);
+                label = matchedSlot + "h";   // "12" → "12h", "15" → "15h"
+            } catch (NumberFormatException ignored) {
+                label = matchedSlot;         // "Noon", "Afternoon", etc. used verbatim
+            }
+            logger.info("SolarAnalysis[" + deviceName + "]: FIRING intermediate run (" + label + ")");
+            return runIntermediate(label, sunsetEpoch);
+        }
     }
 
     // ── Run modes ─────────────────────────────────────────────────────────────
@@ -188,6 +218,7 @@ public class SolarAnalysis implements Task {
         words.put(deneWord("Solar " + label + " Projected SOC At Sunset", projectedSoc, "Double"));
         words.put(deneWord("Solar " + label + " Avg Current mA",          avgCurrentMa, "Double"));
         words.put(deneWord("Solar " + label + " Low Battery Alert",       alert ? 1.0 : 0.0, "Integer"));
+        addBatteryHealthWords(words);
         return words;
     }
 
@@ -267,6 +298,14 @@ public class SolarAnalysis implements Task {
         words.put(deneWord("Solar SOC At Sunset",         socAtSunset,    "Double"));
         words.put(deneWord("Solar mAh At Sunset",         mahAtSunset,    "Double"));
         words.put(deneWord("Solar Anchor Reliable",       anchorReliable ? 1.0 : 0.0, "Integer"));
+        addBatteryHealthWords(words);
+
+        // Arm overnight capacity tracking
+        sunsetOcvSoc      = estimateSocPct(dayLora.get(dayLora.size() - 1)[1]);
+        trackingOvernight = true;
+        overnightMah      = 0;
+        logger.info("SolarAnalysis[" + deviceName + "]: sunset OCV SOC="
+                + String.format("%.1f", sunsetOcvSoc) + "% — overnight tracking started");
         return words;
     }
 
@@ -299,6 +338,46 @@ public class SolarAnalysis implements Task {
             runningMah   -= (cycle[2] * wakeT / 3600.0) + (SLEEP_CURRENT_MA * sleepT / 3600.0);
         }
         return Math.max(0, Math.min(100, Math.round(runningMah / BATTERY_CAPACITY_MAH * 1000.0) / 10.0));
+    }
+
+    private void finalizeOvernightCapacity(double sunriseVoltage) {
+        double sunriseOcvSoc = estimateSocPct(sunriseVoltage);
+        double ocvDrop       = sunsetOcvSoc - sunriseOcvSoc;
+        logger.info("SolarAnalysis[" + deviceName + "]: overnight check"
+                + " discharged=" + String.format("%.1f", overnightMah) + "mAh"
+                + " sunsetSOC=" + String.format("%.1f", sunsetOcvSoc) + "%"
+                + " sunriseSOC=" + String.format("%.1f", sunriseOcvSoc) + "%"
+                + " drop=" + String.format("%.1f", ocvDrop) + "%");
+        if (ocvDrop < 5 || overnightMah < 20) {
+            logger.debug("SolarAnalysis[" + deviceName + "]: overnight data insufficient — skipping capacity estimate");
+            return;
+        }
+        double estimatedCapacity = overnightMah / (ocvDrop / 100.0);
+        // Discard implausible readings (< 30% or > 300% of nominal)
+        if (estimatedCapacity < BATTERY_CAPACITY_MAH * 0.3 || estimatedCapacity > BATTERY_CAPACITY_MAH * 3.0) {
+            logger.warn("SolarAnalysis[" + deviceName + "]: capacity estimate out of range ("
+                    + String.format("%.0f", estimatedCapacity) + " mAh) — discarded");
+            return;
+        }
+        double soh = Math.min(100, estimatedCapacity / BATTERY_CAPACITY_MAH * 100.0);
+        capacityEstimates.add(soh);
+        if (capacityEstimates.size() > 30) capacityEstimates.remove(0);
+        logger.info("SolarAnalysis[" + deviceName + "]: battery SOH=" + String.format("%.1f", soh)
+                + "% (est. capacity=" + String.format("%.0f", estimatedCapacity)
+                + "mAh, " + capacityEstimates.size() + " samples)");
+    }
+
+    private void addBatteryHealthWords(JSONArray words) {
+        double avgSoh   = capacityEstimates.isEmpty() ? 0.0
+                : capacityEstimates.stream().mapToDouble(d -> d).average().orElse(0);
+        double estCapMah = avgSoh / 100.0 * BATTERY_CAPACITY_MAH;
+        boolean alert   = capacityEstimates.size() >= SOH_MIN_SAMPLES && avgSoh < SOH_WARN_PCT;
+        words.put(deneWord("Solar Battery SOH Pct",          avgSoh,    "Double"));
+        words.put(deneWord("Solar Battery Est Capacity mAh", estCapMah, "Double"));
+        words.put(deneWord("Solar Battery Health Alert",      alert ? 1.0 : 0.0, "Integer"));
+        words.put(deneWord("Solar Battery SOH Samples",       (double) capacityEstimates.size(), "Integer"));
+        if (alert) logger.warn("SolarAnalysis[" + deviceName + "]: BATTERY HEALTH ALERT — SOH="
+                + String.format("%.1f", avgSoh) + "% (" + capacityEstimates.size() + " samples)");
     }
 
     /**
