@@ -204,7 +204,7 @@ public class Cerebellum {
                              continue;
                          }
                          String trackingKey = className + ":" + telepathonType + ":" + matchedSlot;
-                         if (false) { // if (!isFrequencyAllowed(trackingKey)) {
+                         if (!isFrequencyAllowed(trackingKey)) {
                              logger.debug("Slot '" + matchedSlot + "' already ran today for "
                                      + task.getName() + "/" + telepathonType);
                              continue;

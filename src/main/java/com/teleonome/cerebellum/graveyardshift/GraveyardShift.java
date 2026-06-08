@@ -166,6 +166,8 @@ public class GraveyardShift implements Task {
         words.put(deneWord("Graveyard Discharge Rate",        dischargeVPerHour,  "Double"));
         words.put(deneWord("Graveyard Night Duration",        hoursOvernight,     "Double"));
         words.put(deneWord("Graveyard TX Cycles",             (double) txCycles,  "Integer"));
+        words.put(deneWordStr("Graveyard Schedule",
+                buildScheduleJson(sunsetEpoch, sunriseEpoch, voltageAtSunset, dischargeVPerHour, sleepSec)));
 
         // Build the Annabelle LoRa command string. Cerebellum will carry this to the
         // cerebellumStatus alongside the Annabelle Action Pointer from the task Dene,
@@ -433,6 +435,22 @@ public class GraveyardShift implements Task {
         	logger.warn(Utils.getStringException(e));
         }
         return 0.0;
+    }
+
+    private String buildScheduleJson(long sunsetEpoch, long sunriseEpoch,
+                                     double voltageAtSunset, double dischargeVPerHour, int sleepSec) {
+        JSONArray schedule = new JSONArray();
+        long   t = sunsetEpoch;
+        double v = voltageAtSunset;
+        while (t <= sunriseEpoch) {
+            JSONObject entry = new JSONObject();
+            entry.put("millis",  t * 1000L);
+            entry.put("voltage", Math.round(v * 1000.0) / 1000.0);
+            schedule.put(entry);
+            t += sleepSec;
+            v -= dischargeVPerHour * (sleepSec / 3600.0);
+        }
+        return schedule.toString();
     }
 
     private String buildAnnabelleCommand(String deviceName,
