@@ -467,6 +467,13 @@ public class Cerebellum {
             long sunsetEpoch = new SunriseSunsetCalculator(
                     new Location(String.valueOf(lat), String.valueOf(lon)), TIMEZONE)
                     .getOfficialSunsetCalendarForDate(now).getTimeInMillis() / 1000;
+            
+            Calendar sunsetCalendar = new SunriseSunsetCalculator(
+                    new Location(String.valueOf(lat), String.valueOf(lon)), TIMEZONE)
+                    .getOfficialSunsetCalendarForDate(now);;
+                 String sunsetTimestamp=	 sunsetCalendar.get(Calendar.HOUR_OF_DAY) + "#" + sunsetCalendar.get(Calendar.MINUTE) + "#"  + sunsetCalendar.get(Calendar.SECOND);
+					
+            logger.debug("line 470, sunsetTimestamp=" + sunsetTimestamp);
             return Math.abs(System.currentTimeMillis() / 1000 - sunsetEpoch) <= SUNSET_WINDOW_SECONDS;
         } catch (Exception e) {
             logger.warn("isNearSunset error: " + e.getMessage());
