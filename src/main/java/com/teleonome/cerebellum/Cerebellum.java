@@ -210,15 +210,16 @@ public class Cerebellum {
                              continue;
                          }
 
+                         // Claim the slot now so re-entrant pulses within the same hour
+                         // don't re-fire even if the task returns empty this time.
+                         lastExecutionEpoch.put(trackingKey, System.currentTimeMillis() / 1000);
+
                          // Execute — task returns empty array if it has nothing ready yet
                          long startTime = System.currentTimeMillis();
                          JSONArray words = task.process(telepathon, matchedSlot);
                          long endTime = System.currentTimeMillis();
                          logger.debug("words=" + words);
                          if (words.length() == 0) continue;
-
-                         // Record this broadcast
-                         lastExecutionEpoch.put(trackingKey, endTime / 1000);
 
                          // Append mandatory timing DeneWords
                          words.put(timingDeneWord(task.getName() + " Execution Time",
