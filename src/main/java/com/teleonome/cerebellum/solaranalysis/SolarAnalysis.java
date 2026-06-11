@@ -193,12 +193,13 @@ public class SolarAnalysis implements Task {
         double currentSoc = computeCoulombSoc(nowEpoch);
         double currentMah = currentSoc / 100.0 * BATTERY_CAPACITY_MAH;
 
-        // Average net current from cycle representatives (one per wake session, not per burst record)
+        // Average discharge current from cycle representatives (positive = discharging).
+        // If all cycles are charging (negative current), net drain is zero — don't project a discharge.
         double avgCurrentMa = cycles.stream()
                 .mapToDouble(r -> r[2])
                 .filter(c -> c > 0)
                 .average()
-                .orElse(100.0);
+                .orElse(0.0);
 
         double hoursToSunset = Math.max(0, (sunsetEpoch - nowEpoch) / 3600.0);
         double projectedMah  = Math.max(0, currentMah - avgCurrentMa * hoursToSunset);
