@@ -40,9 +40,14 @@ public class Cerebellum {
     private static final long   SUNSET_WINDOW_SECONDS = 1800; // ±30 min
 
     // Keyed by "className:deviceName" — tasks are long-lived, stateful instances.
-    private final Map<String, Task> taskRegistry       = new HashMap<>();
+    private final Map<String, Task>    taskRegistry       = new HashMap<>();
     // Epoch second of the last successful broadcast per task key.
-    private final Map<String, Long> lastExecutionEpoch = new HashMap<>();
+    private final Map<String, Long>    lastExecutionEpoch = new HashMap<>();
+    // Latest words per task: key = "className|telepathonType", persists across pulses.
+    private final Map<String, JSONArray> latestTaskWords  = new LinkedHashMap<>();
+    // Epoch of the last scheduled-slot (non-Every-Pulse) broadcast; used as Seconds Time
+    // so that unslotted LiveSoc broadcasts don't trigger new Mnemosyne writes.
+    private long lastAnalysisEpoch = 0;
 
 
     		
@@ -139,7 +144,8 @@ public class Cerebellum {
             taskDenes.sort(Comparator.comparingInt(d ->
                     getDeneWordInt(d, TeleonomeConstants.DENEWORD_CEREBELLUM_EVALUATION_POSITION)));
 
-            Map<String, JSONArray> deviceWords = new LinkedHashMap<>();
+            boolean slottedTaskFired   = false;
+            boolean anyTaskFiredThisPulse = false;
 
             for (JSONObject taskDene : taskDenes) {
                 try {
@@ -238,15 +244,20 @@ public class Cerebellum {
                                      actionPointer, "String"));
                          }
 
-                         // Accumulate into per-device bucket for this pulse's broadcast
-                         JSONArray bucket = deviceWords.computeIfAbsent(telepathonType,
-                                 k -> new JSONArray());
-                         for (int i = 0; i < words.length(); i++) bucket.put(words.get(i));
+                         // Store in persistent per-task cache, keyed by "telepathonType|className".
+                         // The broadcast always merges all cached task words so that a LiveSoc
+                         // pulse doesn't lose the last SolarAnalysis detail words.
+                         latestTaskWords.put(telepathonType + "|" + className, words);
+                         anyTaskFiredThisPulse = true;
+                         if (!TeleonomeConstants.DENEWORD_CEREBELLUM_EXECUTION_FREQUENCY_EVERY_PULSE
+                                 .equals(frequency)) {
+                             slottedTaskFired = true;
+                         }
 
                          logger.info("Task " + task.getName() + " for " + telepathonName
                                  + " produced " + words.length() + " DeneWords in "
                                  + (endTime - startTime) + "ms");
-                         logger.debug(words.toString(4) );
+                         logger.debug(words.toString(4));
                     }
                    
                     
@@ -256,8 +267,15 @@ public class Cerebellum {
                 }
             }
 
-            if (!deviceWords.isEmpty()) {
-                broadcastAnalysis(buildCerebellumDeneChain(deviceWords));
+            if (anyTaskFiredThisPulse) {
+                if (slottedTaskFired) {
+                    lastAnalysisEpoch = System.currentTimeMillis() / 1000;
+                }
+                // Use lastAnalysisEpoch as Seconds Time so unslotted LiveSoc pulses don't
+                // trigger new Mnemosyne writes in DenomeManager (epoch guard stays closed).
+                long broadcastEpoch = lastAnalysisEpoch > 0
+                        ? lastAnalysisEpoch : System.currentTimeMillis() / 1000;
+                broadcastAnalysis(buildCerebellumDeneChain(mergeLatestTaskWords(), broadcastEpoch));
             }
 
         } catch (Exception e) {
@@ -419,6 +437,9 @@ public class Cerebellum {
      * ("12", "15", "Sunset"), so each slot gets its own independent daily gate.
      */
     private String matchExecutionSlot(String executionTime, String frequency, JSONObject telepathon) {
+        if (TeleonomeConstants.DENEWORD_CEREBELLUM_EXECUTION_FREQUENCY_EVERY_PULSE.equals(frequency)) {
+            return "Pulse";
+        }
         if (TeleonomeConstants.DENEWORD_CEREBELLUM_EXECUTION_FREQUENCY_HOURS_IN_A_DAY.equals(frequency)) {
             try {
                 JSONArray slots = new JSONArray(executionTime);
@@ -500,6 +521,7 @@ public class Cerebellum {
 
     /** Returns true if this tracking key has not already fired today. */
     private boolean isFrequencyAllowed(String trackingKey) {
+        if (trackingKey.endsWith(":Pulse")) return true;
         Long lastEpoch = lastExecutionEpoch.get(trackingKey);
         if (lastEpoch == null) return true;
         Calendar last = Calendar.getInstance(TimeZone.getTimeZone(TIMEZONE));
@@ -519,7 +541,7 @@ public class Cerebellum {
                     for (int j = 0; j < words.length(); j++) {
                         JSONObject word = words.getJSONObject(j);
                         if (wordName.equals(word.getString("Name"))) {
-                            return Double.parseDouble(word.getString("Value"));
+                            return word.getDouble("Value");
                         }
                     }
                 }
@@ -548,10 +570,21 @@ public class Cerebellum {
 
     // ── DeneChain builder & broadcast ─────────────────────────────────────────
 
-    private JSONObject buildCerebellumDeneChain(Map<String, JSONArray> deviceWords) {
+    private Map<String, JSONArray> mergeLatestTaskWords() {
+        Map<String, JSONArray> merged = new LinkedHashMap<>();
+        for (Map.Entry<String, JSONArray> entry : latestTaskWords.entrySet()) {
+            String deviceType = entry.getKey().split("\\|")[0];
+            JSONArray bucket = merged.computeIfAbsent(deviceType, k -> new JSONArray());
+            JSONArray words = entry.getValue();
+            for (int i = 0; i < words.length(); i++) bucket.put(words.get(i));
+        }
+        return merged;
+    }
+
+    private JSONObject buildCerebellumDeneChain(Map<String, JSONArray> deviceWords, long epochSec) {
         JSONObject deneChain = new JSONObject();
         deneChain.put("Name", TeleonomeConstants.DENECHAIN_PURPOSE_CEREBELLUM);
-        deneChain.put("Seconds Time", System.currentTimeMillis() / 1000);
+        deneChain.put("Seconds Time", epochSec);
         JSONArray denes = new JSONArray();
         for (Map.Entry<String, JSONArray> entry : deviceWords.entrySet()) {
             JSONObject deviceDene = new JSONObject();
