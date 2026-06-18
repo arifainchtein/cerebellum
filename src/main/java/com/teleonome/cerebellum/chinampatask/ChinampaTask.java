@@ -1,25 +1,19 @@
 package com.teleonome.cerebellum.chinampatask;
 
-import com.teleonome.cerebellum.HippocampusQuery;
 import com.teleonome.cerebellum.Task;
-import com.teleonome.framework.persistence.PostgresqlPersistenceManager;
 
 import org.apache.log4j.Logger;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
-import java.util.Calendar;
-import java.util.TimeZone;
-
 /**
- * Aquaponics monitoring for the Chinampa controller, registered under two
- * Cerebellum Task denes that share this same instance (same className,
- * same device — Cerebellum's getOrCreateTask caches by that key):
- *
- *   "Every Pulse"      -> live flow/height consistency check (matchedSlot="Pulse")
- *   "Hours In A Day"    -> pump cycle count for the hour just finished
- *                          (matchedSlot = hour string "0".."23"), all 24 hours listed
- *                          in Execution Time so it fires every hour.
+ * Aquaponics monitoring for the Chinampa controller — live flow/height
+ * consistency check, registered under an "Every Pulse" Cerebellum Task dene
+ * (matchedSlot = "Pulse"). The hourly pump-cycle count is a separate task,
+ * {@link ChinampaPumpCycleTask} — it needs no shared state with this one, so
+ * splitting them keeps each task's words in their own Cerebellum cache slot
+ * (Cerebellum.latestTaskWords is keyed by className, so two different
+ * cadences sharing one className would overwrite each other's output).
  *
  * Physical layout: fish tank drains via gravity/solenoid into the grow beds;
  * grow beds auto-siphon (batch) into the sump; the pump moves water from the
@@ -32,10 +26,6 @@ import java.util.TimeZone;
  */
 public class ChinampaTask implements Task {
 
-    private static final String TELEONOME_NAME = "ChinampaMonitor";
-    private static final String DEVICE_NAME    = "Chinampa";
-    private static final String TIMEZONE       = "Australia/Melbourne";
-
     // Leak/drift deadband when no flow is expected: 1cm floor + 0.5cm per
     // elapsed minute, to absorb sensor noise and longer-than-usual pulse gaps
     // (e.g. a missed pulse) without false-flagging.
@@ -44,7 +34,6 @@ public class ChinampaTask implements Task {
 
     private final Logger logger = Logger.getLogger(getClass());
     private final String deviceName;
-    private HippocampusQuery queryHandler;
 
     // Previous-pulse state for the live consistency check.
     private Double lastFishTankHeight;
@@ -58,19 +47,8 @@ public class ChinampaTask implements Task {
     @Override public String getName()       { return "ChinampaTask"; }
     @Override public String getDeviceName() { return deviceName; }
 
-    @Override public void setQueryHandler(HippocampusQuery handler) { this.queryHandler = handler; }
-
     @Override
     public JSONArray process(JSONObject telepathon, String matchedSlot) throws Exception {
-        if ("Pulse".equals(matchedSlot)) {
-            return processPulse(telepathon);
-        }
-        return processHourlyPumpCount(matchedSlot);
-    }
-
-    // ── Every-pulse: live flow/height consistency ────────────────────────────
-
-    private JSONArray processPulse(JSONObject telepathon) {
         double fishHeight  = getDeneWordDouble(telepathon, "Purpose", "Fish Tank Measured Height");
         double sumpHeight   = getDeneWordDouble(telepathon, "Purpose", "Sump Trough Measured Height");
         boolean pumpOn      = getDeneWordBoolean(telepathon, "Purpose", "Pump Relay Status");
@@ -141,105 +119,6 @@ public class ChinampaTask implements Task {
     }
 
     private double round(double v) { return Math.round(v * 10.0) / 10.0; }
-
-    // ── Hourly: pump cycle count ──────────────────────────────────────────────
-
-    private JSONArray processHourlyPumpCount(String hourSlot) {
-        int targetHour;
-        try {
-            targetHour = Integer.parseInt(hourSlot);
-        } catch (NumberFormatException e) {
-            return new JSONArray();
-        }
-
-        Calendar windowEnd = Calendar.getInstance(TimeZone.getTimeZone(TIMEZONE));
-        windowEnd.set(Calendar.HOUR_OF_DAY, targetHour);
-        windowEnd.set(Calendar.MINUTE, 0);
-        windowEnd.set(Calendar.SECOND, 0);
-        windowEnd.set(Calendar.MILLISECOND, 0);
-        Calendar windowStart = (Calendar) windowEnd.clone();
-        windowStart.add(Calendar.HOUR_OF_DAY, -1);
-
-        long startEpochSec = windowStart.getTimeInMillis() / 1000;
-        long endEpochSec   = windowEnd.getTimeInMillis() / 1000;
-
-        String identity = "@" + TELEONOME_NAME + ":Telepathons:" + DEVICE_NAME + ":Purpose:Pump Relay Status";
-
-        int cycles = -1;
-        String source = "None";
-
-        if (queryHandler != null) {
-            try {
-                JSONArray data = queryHandler.query(identity, 3600_000L);
-                if (data != null && data.length() > 0) {
-                    cycles = countRisingEdgesFromHippocampus(data, startEpochSec, endEpochSec);
-                    source = "Hippocampus";
-                }
-            } catch (Exception e) {
-                logger.warn("ChinampaTask[" + deviceName + "]: Hippocampus query failed: " + e.getMessage());
-            }
-        }
-
-        if (cycles < 0) {
-            try {
-                JSONArray data = PostgresqlPersistenceManager.instance()
-                        .getTelepathonDeneWordStart(DEVICE_NAME, "Purpose", "Pump Relay Status", startEpochSec, endEpochSec);
-                if (data != null && data.length() > 0) {
-                    cycles = countRisingEdgesFromDatabase(data);
-                    source = "Database";
-                }
-            } catch (Exception e) {
-                logger.warn("ChinampaTask[" + deviceName + "]: database fallback query failed: " + e.getMessage());
-            }
-        }
-
-        if (cycles < 0) {
-            cycles = 0;
-        }
-
-        logger.info("ChinampaTask[" + deviceName + "]: Pump Cycles for hour ending " + targetHour
-                + ":00 = " + cycles + " (source=" + source + ")");
-
-        JSONArray words = new JSONArray();
-        words.put(deneWord("Pump Cycles Last Hour", cycles, "int"));
-        words.put(deneWord("Pump Cycles Last Hour Source", source, "String"));
-        return words;
-    }
-
-    /** Hippocampus entries are {timeSeconds, Value}, ascending order, Value may be Boolean/Number/String. */
-    private int countRisingEdgesFromHippocampus(JSONArray data, long startEpochSec, long endEpochSec) {
-        int cycles = 0;
-        Boolean previous = null;
-        for (int i = 0; i < data.length(); i++) {
-            JSONObject point = data.getJSONObject(i);
-            long t = point.optLong("timeSeconds", -1);
-            if (t < startEpochSec || t >= endEpochSec) continue;
-            boolean current = parseBoolean(point.opt("Value"));
-            if (previous != null && !previous && current) cycles++;
-            previous = current;
-        }
-        return cycles;
-    }
-
-    /** getTelepathonDeneWordStart returns rows ordered timeseconds DESC, Value already 1.0/0.0. */
-    private int countRisingEdgesFromDatabase(JSONArray data) {
-        int cycles = 0;
-        Boolean previous = null;
-        for (int i = data.length() - 1; i >= 0; i--) {
-            JSONObject point = data.getJSONObject(i);
-            boolean current = point.optDouble("Value", 0.0) >= 0.5;
-            if (previous != null && !previous && current) cycles++;
-            previous = current;
-        }
-        return cycles;
-    }
-
-    private boolean parseBoolean(Object value) {
-        if (value instanceof Boolean) return (Boolean) value;
-        if (value instanceof Number) return ((Number) value).doubleValue() >= 0.5;
-        if (value != null) return "true".equalsIgnoreCase(value.toString());
-        return false;
-    }
 
     // ── Telepathon navigation ─────────────────────────────────────────────────
 
