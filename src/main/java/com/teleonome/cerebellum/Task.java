@@ -20,4 +20,11 @@ public interface Task {
      * (e.g. at sunset for time-triggered tasks), and an empty JSONArray otherwise.
      */
     JSONArray process(JSONObject telepathon, String matchedSlot) throws Exception;
+
+    /**
+     * Cerebellum calls this once, right after construction, to hand the task a
+     * way to query Hippocampus's short-term memory. Tasks that don't need
+     * historical lookups can ignore it — default is a no-op.
+     */
+    default void setQueryHandler(HippocampusQuery handler) {}
 }

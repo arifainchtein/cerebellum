@@ -21,6 +21,10 @@ import java.io.File;
 import java.io.FileInputStream;
 import java.lang.management.ManagementFactory;
 import java.util.*;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 public class Cerebellum {
 
@@ -28,6 +32,14 @@ public class Cerebellum {
     private static final long   PING_INTERVAL_MS = 30_000;
 
     private MqttClient client;
+    // Separate connection dedicated to Hippocampus request/response. Kept apart
+    // from `client` because Status-message handling (absorbPulse -> task.process)
+    // runs synchronously on Paho's single callback thread for `client`; if a task
+    // blocked on a Hippocampus reply over that same connection, the reply could
+    // never be delivered (it needs that same thread to be free to receive it).
+    private MqttClient hippocampusClient;
+    private final ConcurrentHashMap<String, CompletableFuture<JSONObject>> pendingHippocampusRequests = new ConcurrentHashMap<>();
+    private static final int HIPPOCAMPUS_QUERY_TIMEOUT_SECONDS = 10;
     private PostgresqlPersistenceManager aDBManager;
     private Logger logger;
     private final int pid;
@@ -120,7 +132,100 @@ public class Cerebellum {
         client.connect(options);
         logger.info("Cerebellum active.");
 
+        startHippocampusClient();
+
         new PingThread().start();
+    }
+
+    private void startHippocampusClient() throws MqttException {
+        hippocampusClient = new MqttClient("tcp://localhost:1883", "Cerebellum_Hippocampus_Query", new MemoryPersistence());
+
+        MqttConnectOptions options = new MqttConnectOptions();
+        options.setCleanSession(true);
+        options.setAutomaticReconnect(true);
+        options.setKeepAliveInterval(120);
+
+        hippocampusClient.setCallback(new MqttCallbackExtended() {
+            @Override
+            public void connectComplete(boolean reconnect, String serverURI) {
+                try {
+                    hippocampusClient.subscribe(TeleonomeConstants.HEART_TOPIC_HIPPOCAMPUS_RESPONSE + "/#", 1);
+                    logger.info("Hippocampus query connection " + (reconnect ? "reconnected" : "connected")
+                            + ", subscribed to response channel");
+                } catch (MqttException e) {
+                    logger.warn("Failed to subscribe to Hippocampus response channel: " + Utils.getStringException(e));
+                }
+            }
+
+            @Override
+            public void connectionLost(Throwable cause) {
+                logger.warn("Hippocampus query connection lost: " + cause.getMessage());
+                pendingHippocampusRequests.forEach((id, f) ->
+                        f.completeExceptionally(new RuntimeException("Hippocampus MQTT connection lost")));
+                pendingHippocampusRequests.clear();
+            }
+
+            @Override
+            public void messageArrived(String topic, MqttMessage message) {
+                try {
+                    JSONObject response = new JSONObject(new String(message.getPayload()));
+                    String requestId = response.optString("RequestId", "");
+                    CompletableFuture<JSONObject> f = pendingHippocampusRequests.remove(requestId);
+                    if (f != null) f.complete(response);
+                } catch (Exception e) {
+                    logger.warn("Hippocampus response parse error: " + e.getMessage());
+                }
+            }
+
+            @Override
+            public void deliveryComplete(IMqttDeliveryToken token) {}
+        });
+
+        hippocampusClient.connect(options);
+    }
+
+    /**
+     * Queries Hippocampus's in-memory short-term history for a DeneWord.
+     * Blocks the calling (task-processing) thread until a response arrives or
+     * HIPPOCAMPUS_QUERY_TIMEOUT_SECONDS elapses. Safe to call from inside a
+     * Task's process() — runs over the dedicated hippocampusClient connection,
+     * not the Status-handling one.
+     *
+     * @param identity full identity string, e.g.
+     *                  "@ChinampaMonitor:Telepathons:Chinampa:Purpose:Pump Relay Status"
+     * @param rangeMs   how much history to ask for, in milliseconds back from now
+     * @return the "Data" JSONArray from Hippocampus's response, or an empty
+     *         array if Hippocampus has nothing for that identity or times out
+     */
+    JSONArray queryHippocampus(String identity, long rangeMs) {
+        if (hippocampusClient == null || !hippocampusClient.isConnected()) {
+            logger.debug("queryHippocampus: not connected, skipping for " + identity);
+            return new JSONArray();
+        }
+        String requestId = UUID.randomUUID().toString();
+        CompletableFuture<JSONObject> future = new CompletableFuture<>();
+        pendingHippocampusRequests.put(requestId, future);
+        try {
+            JSONObject payload = new JSONObject();
+            payload.put("Identity", identity);
+            payload.put("Range", rangeMs);
+            payload.put("RequestId", requestId);
+
+            MqttMessage msg = new MqttMessage(payload.toString().getBytes());
+            msg.setQos(1);
+            hippocampusClient.publish("Hippocampus_Request", msg);
+
+            JSONObject response = future.get(HIPPOCAMPUS_QUERY_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            return response.optJSONArray("Data") != null ? response.getJSONArray("Data") : new JSONArray();
+        } catch (TimeoutException e) {
+            logger.debug("queryHippocampus: timed out for " + identity);
+            return new JSONArray();
+        } catch (Exception e) {
+            logger.warn("queryHippocampus error for " + identity + ": " + e.getMessage());
+            return new JSONArray();
+        } finally {
+            pendingHippocampusRequests.remove(requestId);
+        }
     }
 
     // ── Pulse handling ────────────────────────────────────────────────────────
@@ -153,7 +258,7 @@ public class Cerebellum {
                     if (!getDeneWordBoolean(taskDene, TeleonomeConstants.DENEWORD_CEREBELLUM_ACTIVE)) {
                         continue;
                     }
-                    logger.debug("line 147, taskDene=" + taskDene.toString(4));
+                    logger.debug("line 147, taskDene=" + taskDene.getString(TeleonomeConstants.DENE_NAME_ATTRIBUTE));
                     // Get device name from the typed DeneWord
                    
                     String taskTelepathonType = getDeneWordByType(taskDene,
@@ -559,6 +664,7 @@ public class Cerebellum {
                 Task t = (Task) Class.forName(className)
                         .getConstructor(String.class)
                         .newInstance(deviceName);
+                t.setQueryHandler(this::queryHippocampus);
                 logger.info("Instantiated task: " + className + " for device: " + deviceName);
                 return t;
             } catch (Exception e) {
