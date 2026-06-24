@@ -298,7 +298,7 @@ public class Cerebellum {
                          // Get or create the task instance
                          String className = getDeneWordString(taskDene,
                                  TeleonomeConstants.DENEWORD_CEREBELLUM_TASK_TRUE_EXPRESSION);
-                         Task task = getOrCreateTask(className, telepathonType);
+                         Task task = getOrCreateTask(className, telepathonName);
                          logger.debug("line 191 className= " +className + " task is null=" + (task == null));
 
                          if (task == null) continue;
@@ -314,7 +314,7 @@ public class Cerebellum {
                              logger.debug("No execution slot matched for " + task.getName() + "/" + telepathonType);
                              continue;
                          }
-                         String trackingKey = className + ":" + telepathonType + ":" + matchedSlot;
+                         String trackingKey = className + ":" + telepathonName + ":" + matchedSlot;
                          if (!isFrequencyAllowed(trackingKey)) {
                              logger.debug("Slot '" + matchedSlot + "' already ran today for "
                                      + task.getName() + "/" + telepathonType);
@@ -352,7 +352,7 @@ public class Cerebellum {
                          // Store in persistent per-task cache, keyed by "telepathonType|className".
                          // The broadcast always merges all cached task words so that a LiveSoc
                          // pulse doesn't lose the last SolarAnalysis detail words.
-                         latestTaskWords.put(telepathonType + "|" + className, words);
+                         latestTaskWords.put(telepathonName + "|" + className, words);
                          anyTaskFiredThisPulse = true;
                          if (!TeleonomeConstants.DENEWORD_CEREBELLUM_EXECUTION_FREQUENCY_EVERY_PULSE
                                  .equals(frequency)) {
