@@ -41,6 +41,7 @@ public class PulseTask implements Task {
     private static final double OCV_ANCHOR_MIN_VOLTAGE  = 3.05; // below this the table is too flat
     private static final double OCV_MAX_WAKE_SEC        = 10.0; // brief wake → terminal ≈ OCV
 
+    private final String teleonomeName;
     private final String deviceName;
     private final Logger logger;
 
@@ -52,7 +53,8 @@ public class PulseTask implements Task {
 
     private int pulseCount = 0;
 
-    public PulseTask(String deviceName) {
+    public PulseTask(String teleonomeName, String deviceName) {
+        this.teleonomeName = teleonomeName;
         this.deviceName = deviceName;
         this.logger = Logger.getLogger(getClass());
     }

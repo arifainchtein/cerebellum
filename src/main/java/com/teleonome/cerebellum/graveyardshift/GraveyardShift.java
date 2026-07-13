@@ -48,6 +48,7 @@ public class GraveyardShift implements Task {
     private static final int    WAKE_TIME_SEC_SATURATED      = 255;
 
     private final Logger logger = Logger.getLogger(getClass());
+    private final String teleonomeName;
     private final String deviceName;
 
     // Each entry: [timeSeconds, voltage (V), batteryCurrent (mA), sleepTime (s), wakeTimeSec]
@@ -60,7 +61,8 @@ public class GraveyardShift implements Task {
     // [timeSeconds, SOC%] — only updated when voltage breaks above RELIABLE_ANCHOR_VOLTAGE.
     private double[] bestAnchor = null;
 
-    public GraveyardShift(String deviceName) {
+    public GraveyardShift(String teleonomeName, String deviceName) {
+        this.teleonomeName = teleonomeName;
         this.deviceName = deviceName;
     }
 

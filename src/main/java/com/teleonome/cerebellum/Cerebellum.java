@@ -662,8 +662,8 @@ public class Cerebellum {
         return taskRegistry.computeIfAbsent(key, k -> {
             try {
                 Task t = (Task) Class.forName(className)
-                        .getConstructor(String.class)
-                        .newInstance(deviceName);
+                        .getConstructor(String.class, String.class)
+                        .newInstance(teleonomeName, deviceName);
                 t.setQueryHandler(this::queryHippocampus);
                 logger.info("Instantiated task: " + className + " for device: " + deviceName);
                 return t;

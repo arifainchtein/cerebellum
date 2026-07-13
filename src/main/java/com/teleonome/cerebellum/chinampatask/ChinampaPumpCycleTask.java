@@ -29,15 +29,16 @@ import java.util.TimeZone;
  */
 public class ChinampaPumpCycleTask implements Task {
 
-    private static final String TELEONOME_NAME = "ChinampaMonitor";
     private static final String DEVICE_NAME    = "Chinampa";
     private static final String TIMEZONE       = "Australia/Melbourne";
 
     private final Logger logger = Logger.getLogger(getClass());
+    private final String teleonomeName;
     private final String deviceName;
     private HippocampusQuery queryHandler;
 
-    public ChinampaPumpCycleTask(String deviceName) {
+    public ChinampaPumpCycleTask(String teleonomeName, String deviceName) {
+        this.teleonomeName = teleonomeName;
         this.deviceName = deviceName;
     }
 
@@ -66,7 +67,7 @@ public class ChinampaPumpCycleTask implements Task {
         long startEpochSec = windowStart.getTimeInMillis() / 1000;
         long endEpochSec   = windowEnd.getTimeInMillis() / 1000;
 
-        String identity = "@" + TELEONOME_NAME + ":Telepathons:" + DEVICE_NAME + ":Purpose:Pump Relay Status";
+        String identity = "@" + teleonomeName + ":Telepathons:" + DEVICE_NAME + ":Purpose:Pump Relay Status";
 
         int cycles = -1;
         String source = "None";

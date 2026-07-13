@@ -4,6 +4,7 @@ package com.teleonome.cerebellum.solaranalysis;
 
 import com.luckycatlabs.sunrisesunset.SunriseSunsetCalculator;
 import com.luckycatlabs.sunrisesunset.dto.Location;
+import com.teleonome.cerebellum.HippocampusQuery;
 import com.teleonome.cerebellum.Task;
 import com.teleonome.framework.utils.Utils;
 
@@ -53,7 +54,13 @@ public class SolarAnalysis implements Task {
     private static final int    SOH_MIN_SAMPLES           = 3;    // nights before alerting
 
     private final Logger logger = Logger.getLogger(getClass());
+    private final String teleonomeName;
     private final String deviceName;
+    private HippocampusQuery queryHandler;
+    // True once this instance has either rehydrated from Hippocampus or given up
+    // trying (no history there either). Guards the one-time rehydration attempt
+    // so it only ever runs on the very first process() call of this instance.
+    private boolean rehydrationAttempted = false;
 
     // Each entry: [timeSeconds, voltage, batteryCurrent_mA, sleepTime_s, operatingStatus, lux, wakeTimeSec]
     // wakeTimeSec = firmware "Wake Time Sec" DeneWord — exact active-phase duration.
@@ -69,7 +76,8 @@ public class SolarAnalysis implements Task {
     private boolean trackingOvernight   = false; // true between runSunset() and next sunrise
     private final List<Double> capacityEstimates = new ArrayList<>(); // rolling SOH% history (max 30)
 
-    public SolarAnalysis(String deviceName) {
+    public SolarAnalysis(String teleonomeName, String deviceName) {
+        this.teleonomeName = teleonomeName;
         this.deviceName = deviceName;
     }
 
@@ -78,6 +86,9 @@ public class SolarAnalysis implements Task {
 
     @Override
     public String getDeviceName() { return deviceName; }
+
+    @Override
+    public void setQueryHandler(HippocampusQuery handler) { this.queryHandler = handler; }
 
     @Override
     public JSONArray process(JSONObject telepathon, String matchedSlot) throws Exception {
@@ -107,6 +118,11 @@ public class SolarAnalysis implements Task {
             logger.info("line 98 SolarAnalysis[" + deviceName + "]: midnight reset — clearing " + history.size() + " records");
             history.clear();
             todayMidnight = midnightEpoch;
+        }
+
+        if (!rehydrationAttempted) {
+            attemptRehydration(midnightEpoch);
+            rehydrationAttempted = true;
         }
 
         history.add(new double[]{timeSeconds, voltage, batteryCurrent, sleepSec, status, lux, wakeTimeSec});
@@ -170,6 +186,61 @@ public class SolarAnalysis implements Task {
             }
             logger.info("SolarAnalysis[" + deviceName + "]: FIRING intermediate run (" + label + ")");
             return runIntermediate(label, sunsetEpoch);
+        }
+    }
+
+    // ── Restart recovery ──────────────────────────────────────────────────────
+
+    /**
+     * Runs once, on this instance's first process() call. If Cerebellum was
+     * just restarted mid-day, this instance's history/bestAnchor start empty
+     * even though today's readings already exist in Hippocampus's short-term
+     * memory (written there by the same pulses this instance missed while it
+     * was down). Rehydrates bestAnchor -- the SOC anchor -- from that history
+     * so a restart doesn't reset coulomb counting back to "no confidence"
+     * every time.
+     *
+     * Only bestAnchor is rehydrated, not the full multi-field history array:
+     * Hippocampus tracks each DeneWord as its own independent time series, so
+     * reconstructing synchronized [voltage, current, sleepTime, status, lux,
+     * wakeTimeSec] records would need correlating several separate queries by
+     * timestamp, which isn't worth the complexity for what bestAnchor alone
+     * already fixes. If this is genuinely a fresh day rather than a restart,
+     * the query just comes back with negligible/no data and this is a no-op.
+     */
+    private void attemptRehydration(long midnightEpoch) {
+        if (queryHandler == null || teleonomeName == null || teleonomeName.isEmpty()) return;
+        long nowEpoch  = System.currentTimeMillis() / 1000;
+        long elapsedMs = (nowEpoch - midnightEpoch) * 1000L;
+        if (elapsedMs < 5 * 60 * 1000L) return; // negligible history this early in the day
+
+        try {
+            String identity = "@" + teleonomeName + ":Telepathons:" + deviceName + ":Purpose:Battery Voltage";
+            JSONArray data = queryHandler.query(identity, elapsedMs);
+            if (data == null || data.length() == 0) {
+                logger.debug("SolarAnalysis[" + deviceName + "]: rehydration found no Hippocampus history");
+                return;
+            }
+            double maxVoltage     = 0;
+            long   maxVoltageTime = nowEpoch;
+            for (int i = 0; i < data.length(); i++) {
+                JSONObject entry = data.getJSONObject(i);
+                double v = entry.optDouble("Value", 0);
+                if (v > maxVoltage) {
+                    maxVoltage     = v;
+                    maxVoltageTime = entry.optLong("timeSeconds", nowEpoch);
+                }
+            }
+            if (maxVoltage >= RELIABLE_ANCHOR_VOLTAGE) {
+                bestAnchor = new double[]{maxVoltageTime, estimateSocPct(maxVoltage)};
+                logger.info("SolarAnalysis[" + deviceName + "]: rehydrated anchor from Hippocampus, "
+                        + data.length() + " points, " + maxVoltage + "V = " + bestAnchor[1] + "% SOC");
+            } else {
+                logger.debug("SolarAnalysis[" + deviceName + "]: rehydration found " + data.length()
+                        + " points but max voltage " + maxVoltage + "V never reached reliable anchor threshold");
+            }
+        } catch (Exception e) {
+            logger.warn("SolarAnalysis[" + deviceName + "]: rehydration query failed: " + e.getMessage());
         }
     }
 
