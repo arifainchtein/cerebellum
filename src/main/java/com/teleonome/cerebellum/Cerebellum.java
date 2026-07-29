@@ -7,6 +7,7 @@ import com.teleonome.framework.persistence.PostgresqlPersistenceManager;
 import com.teleonome.framework.utils.Utils;
 import com.teleonome.framework.denome.DenomeUtils;
 import com.teleonome.framework.denome.Identity;
+import com.teleonome.cerebellum.telepathonregistry.TelepathonRegistryTask;
 
 import org.apache.commons.io.FileUtils;
 import org.apache.commons.jexl2.*;
@@ -30,6 +31,12 @@ public class Cerebellum {
 
     private static final String STATUS_FILE_PATH = "/home/pi/Teleonome/CerebellumStatus.json";
     private static final long   PING_INTERVAL_MS = 30_000;
+    // Time-based counterpart to the pulse-driven (event-based) Task dispatch below -
+    // same split the denome's own Mutation system makes between time-based and
+    // event-based mutations. Runs independently of whether any pulse arrives, so it
+    // can notice a device that has stopped pulsing entirely, which a pulse-driven
+    // Task structurally never can.
+    private static final long   REGISTRY_SWEEP_INTERVAL_MS = 5 * 60_000;
 
     private MqttClient client;
     // Separate connection dedicated to Hippocampus request/response. Kept apart
@@ -135,6 +142,7 @@ public class Cerebellum {
         startHippocampusClient();
 
         new PingThread().start();
+        new RegistrySweepThread().start();
     }
 
     private void startHippocampusClient() throws MqttException {
@@ -806,5 +814,41 @@ public class Cerebellum {
                 try { Thread.sleep(PING_INTERVAL_MS); } catch (InterruptedException e) { e.printStackTrace(); }
             }
         }
+    }
+
+    // ── Registry sweep thread ────────────────────────────────────────────────────
+
+    private class RegistrySweepThread extends Thread {
+        RegistrySweepThread() { setDaemon(true); setName("CerebellumRegistrySweep"); }
+
+        @Override
+        public void run() {
+            while (true) {
+                try { Thread.sleep(REGISTRY_SWEEP_INTERVAL_MS); } catch (InterruptedException e) { e.printStackTrace(); }
+                try {
+                    runRegistrySweep();
+                } catch (Exception e) {
+                    logger.warn("RegistrySweepThread: sweep failed: " + Utils.getStringException(e));
+                }
+            }
+        }
+    }
+
+    // teleonomeName is only known after absorbPulse() sees its first Status pulse
+    // (see line ~237) - nothing to sweep against until then.
+    private void runRegistrySweep() throws Exception {
+        if (teleonomeName == null) {
+            logger.debug("RegistrySweepThread: teleonomeName not yet known, skipping this cycle");
+            return;
+        }
+        long nowEpochSec = System.currentTimeMillis() / 1000;
+        JSONArray words = new TelepathonRegistryTask(teleonomeName, "TelepathonRegistrySweep").sweep(nowEpochSec);
+        if (words.length() == 0) return;
+
+        // Synthetic Dene name, distinct from any real device - see
+        // TelepathonRegistryTask.sweep()'s javadoc for why this can't be attached
+        // to a specific device the way pulse-triggered Task output is.
+        latestTaskWords.put("Telepathon Registry|TelepathonRegistryTask", words);
+        broadcastAnalysis(buildCerebellumDeneChain(mergeLatestTaskWords(), nowEpochSec));
     }
 }
