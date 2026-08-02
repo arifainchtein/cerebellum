@@ -17,7 +17,8 @@ import java.util.*;
 
 
 /**
- * Stateful task: accumulates readings across pulses, then at sunset produces
+ * Purpose: project overnight battery state of charge to sunrise. Stateful
+ * task — accumulates readings across pulses, then at sunset produces
  * two complementary SOC estimates and a TX-schedule forecast to sunrise.
  *
  * SOC methods:

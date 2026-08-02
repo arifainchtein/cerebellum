@@ -17,6 +17,11 @@ import java.util.List;
 import java.util.Map;
 
 /**
+ * Purpose: maintain a persistent, never-forgets identity registry per telepathon
+ * (serial number → canonical name), flag corrupted/duplicate identities and
+ * fleet-wide silence, and seed a companion hardware/energy profile per device
+ * (see "Device profile" section below and telepathon_profile.sql).
+ *
  * Reconciles telepathon identity against a persistent, Cerebellum-owned registry
  * (Postgres table "telepathon_registry" - schema in
  * src/main/resources/sql/telepathon_registry.sql, not yet applied to any live DB),
@@ -89,6 +94,42 @@ import java.util.Map;
 public class TelepathonRegistryTask implements Task {
 
     private static final String REGISTRY_TABLE = "telepathon_registry";
+    private static final String PROFILE_TABLE  = "telepathon_profile";
+
+    // DeneWord name Cerebellum.runRegistrySweep() watches for and pulls out of
+    // sweep()'s returned words to hand to publishEmergency() - a one-shot event,
+    // not part of the ongoing status broadcast (see sweep() and evaluateLateness()).
+    // Task.process()/sweep() have no direct MQTT access (see Task.java), so this
+    // DeneWord-name convention is how a Task flags an emergency for Cerebellum.java
+    // to publish on its behalf, without changing the Task interface itself.
+    public static final String EMERGENCY_ALERT_WORD_NAME = "Telepathon Registry Emergency Alert";
+
+    // Hardcoded per-Device-Type-Id hardware defaults - the last-resort fallback
+    // when FactoryHardwareProfileClient is disabled or has no record for this
+    // serial number (see telepathon_profile.sql). Battery capacity for Daffodil
+    // matches the BATTERY_CAPACITY_MAH constant already established in
+    // GraveyardShift/PulseTask/SolarAnalysis - everything else here is a
+    // placeholder pending confirmed numbers. Package-visible so
+    // FactoryHardwareProfileClient can return the same shape.
+    static class DeviceProfileDefault {
+        final String pcbBoards;
+        final String batteryType;
+        final Double batteryCapacityMah;
+        final Double panelWatts;
+        DeviceProfileDefault(String pcbBoards, String batteryType, Double batteryCapacityMah, Double panelWatts) {
+            this.pcbBoards = pcbBoards;
+            this.batteryType = batteryType;
+            this.batteryCapacityMah = batteryCapacityMah;
+            this.panelWatts = panelWatts;
+        }
+    }
+    private static final Map<String, DeviceProfileDefault> DEVICE_TYPE_DEFAULT_PROFILES = new HashMap<>();
+    static {
+        DEVICE_TYPE_DEFAULT_PROFILES.put("Daffodil", new DeviceProfileDefault(
+                "Wally Build 17, Daffodil Build 8", "LiFePO4 1S", 600.0, null));
+        DEVICE_TYPE_DEFAULT_PROFILES.put("Langley", new DeviceProfileDefault(
+                "Valentino Build 2, Langley Build 2", "LiFePO4 1S", null, null));
+    }
 
     // [WARNING_SEC, CRITICAL_SEC] per Device Type Id. Langley is the one entry
     // backed by real data (~1s pulse cadence, matches LangleySilenceSweep). Every
@@ -104,6 +145,11 @@ public class TelepathonRegistryTask implements Task {
     // TODO: placeholder for any Device Type Id not listed above (Gloria, Chinampa,
     // Valentino-based devices, ...) - needs real per-type numbers.
     private static final long[] DEFAULT_THRESHOLDS_SEC = {30 * 60, 60 * 60};
+
+    // Shared across every per-device instance (same rationale as
+    // LangleyTopologyTask's static fleet map) - one HttpClient, one
+    // lib/app.properties read, not one per device.
+    private static final FactoryHardwareProfileClient FACTORY_CLIENT = new FactoryHardwareProfileClient();
 
     private final String teleonomeName;
     private final String deviceName;
@@ -168,6 +214,12 @@ public class TelepathonRegistryTask implements Task {
      * split the denome mutation system already makes between time-based and
      * event-based mutations), independent of pulse arrival, and broadcast under
      * its own synthetic "Telepathon Registry" Dene rather than a real device's.
+     *
+     * Also emits one EMERGENCY_ALERT_WORD_NAME word per device whose lateness
+     * status just transitioned into WARNING/CRITICAL (see evaluateLateness()) -
+     * Cerebellum.runRegistrySweep() pulls these out and calls publishEmergency()
+     * with them rather than folding them into the ongoing status broadcast, so a
+     * device that stays late doesn't re-alert on every 5-minute sweep.
      */
     public JSONArray sweep(long nowEpochSec) throws SQLException {
         JSONArray words = new JSONArray();
@@ -181,6 +233,12 @@ public class TelepathonRegistryTask implements Task {
             }
             words.put(deneWord("Telepathon Registry Status", worst, "String"));
             words.put(deneWord("Telepathon Registry Late Devices", lateDevicesToJson(late), "String"));
+            for (LateDevice d : late) {
+                if (!d.alertWorthy) continue;
+                String message = "Telepathon " + d.canonicalName + " has gone missing (no data for "
+                        + (d.ageSec / 60) + " minutes)";
+                words.put(deneWord(EMERGENCY_ALERT_WORD_NAME, message, "String"));
+            }
         } finally {
             PostgresqlPersistenceManager.instance().closeConnection(conn);
         }
@@ -310,6 +368,8 @@ public class TelepathonRegistryTask implements Task {
 
         ReconcileOutcome outcome = decideReconciliation(existingCanonicalName, reportedName);
 
+        ensureProfileDefaults(conn, serialNumber, deviceType);
+
         if (existingCanonicalName == null) {
             String duplicateOf = matchFingerprint(deviceType, groupIdentifier, latitude, longitude,
                     loadFingerprintCandidates(conn, deviceType, serialNumber));
@@ -360,6 +420,99 @@ public class TelepathonRegistryTask implements Task {
         return outcome;
     }
 
+    // ── Device profile ───────────────────────────────────────────────────────────
+
+    static class DeviceProfile {
+        final String pcbBoards;
+        final String batteryType;
+        final Double batteryCapacityMah;
+        final Double panelWatts;
+        final String profileSource;   // "Default" | "Factory" | "Manual"
+        final String energyRecommendation;
+        final String energyRecommendationStatus;
+        DeviceProfile(String pcbBoards, String batteryType, Double batteryCapacityMah, Double panelWatts,
+                      String profileSource, String energyRecommendation, String energyRecommendationStatus) {
+            this.pcbBoards = pcbBoards;
+            this.batteryType = batteryType;
+            this.batteryCapacityMah = batteryCapacityMah;
+            this.panelWatts = panelWatts;
+            this.profileSource = profileSource;
+            this.energyRecommendation = energyRecommendation;
+            this.energyRecommendationStatus = energyRecommendationStatus;
+        }
+    }
+
+    // Seeds a profile row the first time a serial number is seen. Never
+    // overwrites an existing row - once profile_source is 'Manual' (a real
+    // injection form, not yet built, or a hand edit) this must not stomp it
+    // back to a lesser source, and even a 'Factory'/'Default' row is left
+    // alone once written (no periodic refresh - see FactoryHardwareProfileClient
+    // javadoc for why re-querying Factory on every pulse isn't done here).
+    //
+    // Source preference: FactoryHardwareProfileClient (real per-product-definition
+    // BOM, keyed by this exact serial number) first, falling back to the
+    // hardcoded per-Device-Type-Id defaults only when the client is disabled or
+    // has no record for this serial - see class javadoc on
+    // FactoryHardwareProfileClient for the endpoint contract this depends on.
+    private void ensureProfileDefaults(Connection conn, String serialNumber, String deviceType) throws SQLException {
+        try (PreparedStatement select = conn.prepareStatement(
+                "SELECT 1 FROM " + PROFILE_TABLE + " WHERE teleonome_name = ? AND serial_number = ?")) {
+            select.setString(1, teleonomeName);
+            select.setString(2, serialNumber);
+            try (ResultSet rs = select.executeQuery()) {
+                if (rs.next()) return; // profile already exists - leave it alone regardless of source
+            }
+        }
+
+        DeviceProfileDefault def = FACTORY_CLIENT.fetch(serialNumber);
+        String profileSource = "Default";
+        if (def != null) {
+            profileSource = "Factory";
+        } else {
+            def = DEVICE_TYPE_DEFAULT_PROFILES.get(deviceType);
+        }
+
+        try (PreparedStatement insert = conn.prepareStatement(
+                "INSERT INTO " + PROFILE_TABLE + " (teleonome_name, serial_number, device_type, "
+                        + "pcb_boards, battery_type, battery_capacity_mah, panel_watts, profile_source) "
+                        + "VALUES (?,?,?,?,?,?,?,?)")) {
+            insert.setString(1, teleonomeName);
+            insert.setString(2, serialNumber);
+            insert.setString(3, deviceType);
+            insert.setString(4, def != null ? def.pcbBoards : null);
+            insert.setString(5, def != null ? def.batteryType : null);
+            if (def != null && def.batteryCapacityMah != null) insert.setDouble(6, def.batteryCapacityMah);
+            else insert.setNull(6, java.sql.Types.DOUBLE);
+            if (def != null && def.panelWatts != null) insert.setDouble(7, def.panelWatts);
+            else insert.setNull(7, java.sql.Types.DOUBLE);
+            insert.setString(8, profileSource);
+            insert.executeUpdate();
+        }
+        logger.info("TelepathonRegistryTask: seeded " + profileSource + " profile for serial='" + serialNumber
+                + "' type='" + deviceType + "'" + (def == null ? " (no known defaults for this Device Type Id)" : ""));
+    }
+
+    // Not yet called from anywhere - a read hook for whoever builds the
+    // recommendation logic / injection form / webapp view on top of this table.
+    DeviceProfile getProfile(Connection conn, String serialNumber) throws SQLException {
+        try (PreparedStatement select = conn.prepareStatement(
+                "SELECT pcb_boards, battery_type, battery_capacity_mah, panel_watts, profile_source, "
+                        + "energy_recommendation, energy_recommendation_status FROM " + PROFILE_TABLE
+                        + " WHERE teleonome_name = ? AND serial_number = ?")) {
+            select.setString(1, teleonomeName);
+            select.setString(2, serialNumber);
+            try (ResultSet rs = select.executeQuery()) {
+                if (!rs.next()) return null;
+                double capMah = rs.getDouble(3);
+                Double batteryCapacityMah = rs.wasNull() ? null : capMah;
+                double watts = rs.getDouble(4);
+                Double panelWatts = rs.wasNull() ? null : watts;
+                return new DeviceProfile(rs.getString(1), rs.getString(2), batteryCapacityMah, panelWatts,
+                        rs.getString(5), rs.getString(6), rs.getString(7));
+            }
+        }
+    }
+
     // ── Lateness ─────────────────────────────────────────────────────────────────
 
     private static class LateDevice {
@@ -367,11 +520,17 @@ public class TelepathonRegistryTask implements Task {
         final String deviceType;
         final long ageSec;
         final String status;
-        LateDevice(String canonicalName, String deviceType, long ageSec, String status) {
+        // True only when this sweep is what moved the device from its previously
+        // recorded alert status into this one (see evaluateLateness()) - the
+        // signal sweep() uses to decide which devices are worth an Emergency
+        // Channel publish, as opposed to a device that's simply still late.
+        final boolean alertWorthy;
+        LateDevice(String canonicalName, String deviceType, long ageSec, String status, boolean alertWorthy) {
             this.canonicalName = canonicalName;
             this.deviceType = deviceType;
             this.ageSec = ageSec;
             this.status = status;
+            this.alertWorthy = alertWorthy;
         }
     }
 
@@ -386,26 +545,52 @@ public class TelepathonRegistryTask implements Task {
         return "OK";
     }
 
+    // Also persists each device's computed status back to last_alert_status so
+    // the *next* sweep can tell a fresh transition (worth an emergency alert)
+    // apart from a device that's simply still late from before (not worth
+    // re-alerting on every 5-minute sweep) - see LateDevice.alertWorthy and
+    // telepathon_registry.sql's column comment.
     private List<LateDevice> evaluateLateness(Connection conn, long nowEpochSec) throws SQLException {
         List<LateDevice> late = new ArrayList<>();
         try (PreparedStatement select = conn.prepareStatement(
-                "SELECT canonical_name, device_type, last_seen_epoch FROM " + REGISTRY_TABLE
-                        + " WHERE teleonome_name = ?")) {
+                "SELECT serial_number, canonical_name, device_type, last_seen_epoch, last_alert_status "
+                        + "FROM " + REGISTRY_TABLE + " WHERE teleonome_name = ?")) {
             select.setString(1, teleonomeName);
             try (ResultSet rs = select.executeQuery()) {
                 while (rs.next()) {
-                    String canonicalName  = rs.getString(1);
-                    String deviceType     = rs.getString(2);
-                    long lastSeenEpochSec = rs.getLong(3);
+                    String serialNumber   = rs.getString(1);
+                    String canonicalName  = rs.getString(2);
+                    String deviceType     = rs.getString(3);
+                    long lastSeenEpochSec = rs.getLong(4);
+                    String previousStatus = rs.getString(5); // null = never swept, treat as "OK"
                     long ageSec = nowEpochSec - lastSeenEpochSec;
                     String status = statusFor(ageSec, thresholdsFor(deviceType));
+
+                    boolean statusChanged = !status.equals(previousStatus == null ? "OK" : previousStatus);
+                    if (statusChanged) {
+                        updateAlertStatus(conn, serialNumber, status);
+                    }
+                    // Never alert on recovery (status == "OK") - only on entering or
+                    // escalating within WARNING/CRITICAL.
+                    boolean alertWorthy = statusChanged && !"OK".equals(status);
+
                     if (!"OK".equals(status)) {
-                        late.add(new LateDevice(canonicalName, deviceType, ageSec, status));
+                        late.add(new LateDevice(canonicalName, deviceType, ageSec, status, alertWorthy));
                     }
                 }
             }
         }
         return late;
+    }
+
+    private void updateAlertStatus(Connection conn, String serialNumber, String status) throws SQLException {
+        try (PreparedStatement update = conn.prepareStatement(
+                "UPDATE " + REGISTRY_TABLE + " SET last_alert_status = ? WHERE teleonome_name = ? AND serial_number = ?")) {
+            update.setString(1, status);
+            update.setString(2, teleonomeName);
+            update.setString(3, serialNumber);
+            update.executeUpdate();
+        }
     }
 
     private String lateDevicesToJson(List<LateDevice> late) {

@@ -12,8 +12,8 @@ import java.util.Calendar;
 import java.util.TimeZone;
 
 /**
- * Counts how many times the Chinampa pump turned on during the hour just
- * finished. Registered under a "Hours In A Day" Cerebellum Task dene with
+ * Purpose: count how many times the Chinampa pump turned on during the hour
+ * just finished. Registered under a "Hours In A Day" Cerebellum Task dene with
  * all 24 hours listed in Execution Time, so matchedSlot arrives as an hour
  * string ("0".."23") once per hour, every hour.
  *

@@ -9,7 +9,9 @@ import org.json.JSONArray;
 import org.json.JSONObject;
 
 /**
- * Runs on every LoRa pulse ("Every Pulse" frequency).
+ * Purpose: maintain live, sub-hourly battery state-of-charge estimates via
+ * coulomb counting, anchored/recalibrated against voltage readings. Runs on
+ * every LoRa pulse ("Every Pulse" frequency).
  *
  * All calculations that need sub-hourly refresh live here. Each output word
  * has its own internal cadence — some update every pulse, others every N pulses.

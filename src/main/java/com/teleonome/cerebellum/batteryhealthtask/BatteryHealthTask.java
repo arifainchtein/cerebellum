@@ -13,7 +13,7 @@ import org.json.JSONObject;
 import java.util.Arrays;
 
 /**
- * Classifies a telepathon's own reported Battery Voltage (1S LiFePO4 —
+ * Purpose: classify a telepathon's own reported Battery Voltage (1S LiFePO4 —
  * Daffodil, Langley, Gloria) into OK/WARNING/CRITICAL every pulse.
  *
  * Thresholds match the voltage table already used by PulseTask for SOC

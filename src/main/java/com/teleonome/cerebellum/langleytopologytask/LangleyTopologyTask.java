@@ -14,9 +14,9 @@ import java.util.Arrays;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * Localizes electric-fence faults on a Langley network by walking one hop of the
- * (deviceshortname, parentShortname) tree on every pulse and comparing a node's
- * self-reported readings against its immediate parent's.
+ * Purpose: localize electric-fence faults on a Langley network by walking one
+ * hop of the (deviceshortname, parentShortname) tree on every pulse and
+ * comparing a node's self-reported readings against its immediate parent's.
  *
  * Two distinct edge-level fault signals, both requiring a live parent snapshot:
  *

@@ -15,8 +15,10 @@ import java.util.Map;
 import java.util.TimeZone;
 
 /**
- * Standalone sweep for Langley comms silence - run on a wall-clock schedule
- * (Pi crontab), independent of any MQTT pulse.
+ * Purpose: detect Langley units that have gone completely silent (no
+ * telepathon at all), which a pulse-driven Task can never notice on its own.
+ * Standalone sweep run on a wall-clock schedule (Pi crontab), independent of
+ * any MQTT pulse.
  *
  * Complements {@code LangleyTopologyTask}, which localizes fence-wire faults by
  * comparing a node against its parent on every pulse but can only ever react to

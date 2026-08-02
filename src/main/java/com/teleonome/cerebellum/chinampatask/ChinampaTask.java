@@ -7,7 +7,7 @@ import org.json.JSONArray;
 import org.json.JSONObject;
 
 /**
- * Aquaponics monitoring for the Chinampa controller — live flow/height
+ * Purpose: aquaponics monitoring for the Chinampa controller — live flow/height
  * consistency check, registered under an "Every Pulse" Cerebellum Task dene
  * (matchedSlot = "Pulse"). The hourly pump-cycle count is a separate task,
  * {@link ChinampaPumpCycleTask} — it needs no shared state with this one, so

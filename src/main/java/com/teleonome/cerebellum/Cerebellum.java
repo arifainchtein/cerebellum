@@ -727,6 +727,32 @@ public class Cerebellum {
         // Handle incoming Cerebellum_Request messages.
     }
 
+    // ── Emergency Channel ─────────────────────────────────────────────────────
+
+    // One-shot alert banner in teleonomewebapp, distinct from the ongoing
+    // per-cycle status broadcast (broadcastAnalysis) - each call creates a new,
+    // separate banner entry there rather than overwriting a "current status", so
+    // callers must only invoke this on a state transition worth an operator's
+    // attention (e.g. a telepathon newly going missing), never every cycle a
+    // condition remains true. See TelepathonRegistryTask.EMERGENCY_ALERT_WORD_NAME
+    // for how a Task flags one of these without needing direct MQTT access itself.
+    private void publishEmergency(String sender, String message) {
+        try {
+            JSONObject payload = new JSONObject();
+            payload.put("Sender", sender);
+            payload.put("Message", message);
+            payload.put("TimestampMillis", System.currentTimeMillis());
+
+            MqttMessage mqttMessage = new MqttMessage(payload.toString().getBytes());
+            mqttMessage.setQos(TeleonomeConstants.HEART_QUALITY_OF_SERVICE);
+            mqttMessage.setRetained(false);
+            client.publish(TeleonomeConstants.HEART_TOPIC_EMERGENCY_CHANNEL, mqttMessage);
+            logger.info("Emergency published to " + TeleonomeConstants.HEART_TOPIC_EMERGENCY_CHANNEL + ": " + message);
+        } catch (Exception e) {
+            logger.warn("publishEmergency failed: " + Utils.getStringException(e));
+        }
+    }
+
     // ── DeneWord accessors (navigate a task Dene) ─────────────────────────────
 
     private boolean getDeneWordBoolean(JSONObject dene, String wordName) {
@@ -845,10 +871,23 @@ public class Cerebellum {
         JSONArray words = new TelepathonRegistryTask(teleonomeName, "TelepathonRegistrySweep").sweep(nowEpochSec);
         if (words.length() == 0) return;
 
+        // Emergency-alert words are a one-shot event for publishEmergency(), not
+        // part of the ongoing status broadcast - pull them out before merging
+        // into latestTaskWords (see TelepathonRegistryTask.EMERGENCY_ALERT_WORD_NAME).
+        JSONArray statusWords = new JSONArray();
+        for (int i = 0; i < words.length(); i++) {
+            JSONObject word = words.getJSONObject(i);
+            if (TelepathonRegistryTask.EMERGENCY_ALERT_WORD_NAME.equals(word.optString("Name"))) {
+                publishEmergency("Cerebellum", word.optString("Value"));
+            } else {
+                statusWords.put(word);
+            }
+        }
+
         // Synthetic Dene name, distinct from any real device - see
         // TelepathonRegistryTask.sweep()'s javadoc for why this can't be attached
         // to a specific device the way pulse-triggered Task output is.
-        latestTaskWords.put("Telepathon Registry|TelepathonRegistryTask", words);
+        latestTaskWords.put("Telepathon Registry|TelepathonRegistryTask", statusWords);
         broadcastAnalysis(buildCerebellumDeneChain(mergeLatestTaskWords(), nowEpochSec));
     }
 }

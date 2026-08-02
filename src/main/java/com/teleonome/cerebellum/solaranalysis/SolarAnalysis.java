@@ -13,10 +13,16 @@ import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * Stateful task that runs three times per day at hours [12, 15, "Sunset"] via
- * the "Hours In A Day" execution frequency.
+ * Purpose: track daytime solar charging health and project whether the
+ * battery will make it through the day/night cycle in good shape — day-mode
+ * mix, lux trend, and coulomb-based SOC projection to sunset — and flag a
+ * device whose panel is persistently underperforming its own site's best
+ * performer (a physical-positioning symptom, not a battery-health one).
+ * Stateful task that runs three times per day at hours [12, 15, "Sunset"]
+ * via the "Hours In A Day" execution frequency.
  *
  * Each run mode accumulates data and produces different DeneWords:
  *
@@ -27,8 +33,9 @@ import java.util.*;
  *           More urgent alert threshold than the noon run.
  *
  *   Sunset — Final analysis: day mode percentages (Active/Cloudy/Sleep),
- *             lux correlation, and definitive coulomb SOC at sunset.
- *             This SOC value is the canonical handoff to GraveyardShift.
+ *             lux correlation, definitive coulomb SOC at sunset, and the
+ *             panel-positioning sibling comparison (see addPanelPositionWords).
+ *             The SOC value is the canonical handoff to GraveyardShift.
  *
  * Weather forecast integration: the projected SOC at 12h/15h currently uses
  * measured average discharge rate. When weather forecast data (cloudiness % per
@@ -52,6 +59,14 @@ public class SolarAnalysis implements Task {
     private static final double LOW_BATTERY_ALERT_PCT     = 20.0; // warn if projected SOC < this
     private static final double SOH_WARN_PCT              = 70.0; // alert when rolling-avg SOH below this
     private static final int    SOH_MIN_SAMPLES           = 3;    // nights before alerting
+    // Panel-positioning check: this device's daily peak lux vs the best peak lux any
+    // sibling at the same site saw the same day (same weather, same day - relative
+    // comparison, no clear-sky/astronomical model needed). Persistently trailing your
+    // own site's best performer points at a physically poorly-aimed panel rather than
+    // a bad battery or a cloudy day (which would depress every device at the site alike).
+    private static final double POSITION_UNDERPERFORM_RATIO = 0.70; // below 70% of best sibling is suspect
+    private static final int    POSITION_MIN_SAMPLES         = 3;   // comparison days before alerting
+    private static final int    POSITION_MAX_SAMPLES         = 14;  // rolling window cap
 
     private final Logger logger = Logger.getLogger(getClass());
     private final String teleonomeName;
@@ -75,6 +90,15 @@ public class SolarAnalysis implements Task {
     private double  overnightMah        = 0;     // coulomb-counted discharge since sunset
     private boolean trackingOvernight   = false; // true between runSunset() and next sunrise
     private final List<Double> capacityEstimates = new ArrayList<>(); // rolling SOH% history (max 30)
+
+    // Panel positioning — static because localizing an underperformer needs visibility
+    // across every device at the same site, not just this task instance's own device
+    // (same reasoning as LangleyTopologyTask's static fleet map). Keyed by site, then
+    // device name, holding [dayMidnightEpoch, peakLuxThatDay] so a stale previous-day
+    // reading from a sibling that hasn't reported yet today is never compared against.
+    private static final ConcurrentHashMap<String, ConcurrentHashMap<String, double[]>> siteDailyPeakLux
+            = new ConcurrentHashMap<>();
+    private final List<Double> positionRatioHistory = new ArrayList<>(); // rolling ratio-to-best-sibling (max 14)
 
     public SolarAnalysis(String teleonomeName, String deviceName) {
         this.teleonomeName = teleonomeName;
@@ -100,6 +124,7 @@ public class SolarAnalysis implements Task {
         double wakeTimeSec    = getDeneWordDouble(telepathon, "Purpose", "Wake Time Sec");
         double lat            = getDeneWordDouble(telepathon, "Configuration", "Latitude");
         double lon            = getDeneWordDouble(telepathon, "Configuration", "longitude");
+        String groupIdentifier = getDeneWordString(telepathon, "Configuration", "Group identifier");
         long   timeSeconds    = telepathon.optLong("Seconds Time", System.currentTimeMillis() / 1000);
         logger.debug("Starting to process Solar Analysis");
         if (lat == 0) {
@@ -171,7 +196,14 @@ public class SolarAnalysis implements Task {
 
         if ("Sunset".equalsIgnoreCase(matchedSlot)) {
             logger.info("SolarAnalysis[" + deviceName + "]: FIRING sunset run");
-            return runSunset(sunriseEpoch, sunsetEpoch);
+            // Group identifier ties siblings at the same physical site together; not
+            // every Device Type Id reports one (e.g. Langley), so fall back to a
+            // rounded lat/lon key (~111m grid) the same way TelepathonRegistryTask's
+            // fingerprint match does when Group identifier alone isn't available.
+            String siteKey = (groupIdentifier != null && !groupIdentifier.isEmpty())
+                    ? groupIdentifier
+                    : (Math.round(lat * 1000.0) / 1000.0) + "," + (Math.round(lon * 1000.0) / 1000.0);
+            return runSunset(sunriseEpoch, sunsetEpoch, siteKey);
         } else if ("Sunrise".equalsIgnoreCase(matchedSlot)) {
             logger.debug("SolarAnalysis[" + deviceName + "]: Sunrise slot — no action defined");
             return new JSONArray();
@@ -295,7 +327,7 @@ public class SolarAnalysis implements Task {
     }
 
     /** Sunset run: definitive mode percentages, lux correlation, and coulomb SOC. */
-    private JSONArray runSunset(long sunriseEpoch, long sunsetEpoch) {
+    private JSONArray runSunset(long sunriseEpoch, long sunsetEpoch, String siteKey) {
         // Use cycle representatives for mode analysis (one entry per wake session)
         List<double[]> dayLora = new ArrayList<>();
         logger.debug("line 201");
@@ -371,6 +403,8 @@ public class SolarAnalysis implements Task {
         words.put(deneWord("Solar mAh At Sunset",         mahAtSunset,    "Double"));
         words.put(deneWord("Solar Anchor Reliable",       anchorReliable ? 1.0 : 0.0, "Integer"));
         addBatteryHealthWords(words);
+        double peakLuxToday = dayLora.stream().mapToDouble(r -> r[5]).max().orElse(0);
+        addPanelPositionWords(words, siteKey, todayMidnight, peakLuxToday);
 
         // Arm overnight capacity tracking
         sunsetOcvSoc      = estimateSocPct(dayLora.get(dayLora.size() - 1)[1]);
@@ -450,6 +484,44 @@ public class SolarAnalysis implements Task {
         words.put(deneWord("Solar Battery SOH Samples",       (double) capacityEstimates.size(), "Integer"));
         if (alert) logger.warn("SolarAnalysis[" + deviceName + "]: BATTERY HEALTH ALERT — SOH="
                 + String.format("%.1f", avgSoh) + "% (" + capacityEstimates.size() + " samples)");
+    }
+
+    // ── Panel positioning (sibling comparison) ────────────────────────────────
+
+    private void addPanelPositionWords(JSONArray words, String siteKey, long dayMidnight, double peakLuxToday) {
+        siteDailyPeakLux.computeIfAbsent(siteKey, k -> new ConcurrentHashMap<>())
+                .put(deviceName, new double[]{dayMidnight, peakLuxToday});
+
+        double bestSiblingLux  = 0;
+        String bestSiblingName = null;
+        for (Map.Entry<String, double[]> e : siteDailyPeakLux.get(siteKey).entrySet()) {
+            if (e.getKey().equals(deviceName)) continue;
+            double[] v = e.getValue();
+            if ((long) v[0] != dayMidnight) continue; // sibling hasn't reported today yet — stale, skip
+            if (v[1] > bestSiblingLux) { bestSiblingLux = v[1]; bestSiblingName = e.getKey(); }
+        }
+
+        // No sibling at this site (yet) reported today — nothing to compare against.
+        if (bestSiblingName == null || bestSiblingLux <= 0 || peakLuxToday <= 0) {
+            words.put(deneWord("Solar Position Status", "Not Applicable", "String"));
+            return;
+        }
+
+        double ratio = peakLuxToday / bestSiblingLux;
+        positionRatioHistory.add(ratio);
+        if (positionRatioHistory.size() > POSITION_MAX_SAMPLES) positionRatioHistory.remove(0);
+        double avgRatio = positionRatioHistory.stream().mapToDouble(d -> d).average().orElse(1.0);
+        boolean alert = positionRatioHistory.size() >= POSITION_MIN_SAMPLES && avgRatio < POSITION_UNDERPERFORM_RATIO;
+
+        words.put(deneWord("Solar Position Ratio To Best Sibling", ratio,    "Double"));
+        words.put(deneWord("Solar Position Ratio Avg",             avgRatio, "Double"));
+        words.put(deneWord("Solar Position Samples", (double) positionRatioHistory.size(), "Integer"));
+        words.put(deneWord("Solar Position Best Sibling", bestSiblingName, "String"));
+        words.put(deneWord("Solar Position Status", alert ? "WARNING" : "OK", "String"));
+        words.put(deneWord("Solar Position Alert", alert ? 1.0 : 0.0, "Integer"));
+        if (alert) logger.warn("SolarAnalysis[" + deviceName + "]: PANEL POSITION ALERT — avg peak lux "
+                + String.format("%.0f", avgRatio * 100) + "% of best sibling '" + bestSiblingName
+                + "' over " + positionRatioHistory.size() + " days");
     }
 
     /**
@@ -580,10 +652,39 @@ public class SolarAnalysis implements Task {
         return 0.0;
     }
 
+    private String getDeneWordString(JSONObject deneChain, String deneName, String wordName) {
+        try {
+            JSONArray denes = deneChain.getJSONArray("Denes");
+            for (int i = 0; i < denes.length(); i++) {
+                JSONObject dene = denes.getJSONObject(i);
+                if (deneName.equals(dene.getString("Name"))) {
+                    JSONArray words = dene.getJSONArray("DeneWords");
+                    for (int j = 0; j < words.length(); j++) {
+                        JSONObject word = words.getJSONObject(j);
+                        if (wordName.equals(word.getString("Name"))) {
+                            return word.getString("Value");
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            logger.debug("getDeneWordString: " + Utils.getStringException(e));
+        }
+        return null;
+    }
+
     private JSONObject deneWord(String name, double value, String type) {
         JSONObject w = new JSONObject();
         w.put("Name",  name);
         w.put("Value", String.valueOf(value));
+        w.put("Type",  type);
+        return w;
+    }
+
+    private JSONObject deneWord(String name, String value, String type) {
+        JSONObject w = new JSONObject();
+        w.put("Name",  name);
+        w.put("Value", value);
         w.put("Type",  type);
         return w;
     }
