@@ -1,5 +1,7 @@
 package com.teleonome.cerebellum.telepathonregistry;
 
+
+
 import com.teleonome.cerebellum.Task;
 import com.teleonome.framework.persistence.PostgresqlPersistenceManager;
 
@@ -98,7 +100,7 @@ public class TelepathonRegistryTask implements Task {
 
     // DeneWord name Cerebellum.runRegistrySweep() watches for and pulls out of
     // sweep()'s returned words to hand to publishEmergency() - a one-shot event,
-    // not part of the ongoing status broadcast (see sweep() and evaluateLateness()).
+    // not part of the ongoing status broadcast (see sweep() and evaluateDeviceStatuses()).
     // Task.process()/sweep() have no direct MQTT access (see Task.java), so this
     // DeneWord-name convention is how a Task flags an emergency for Cerebellum.java
     // to publish on its behalf, without changing the Task interface itself.
@@ -216,7 +218,7 @@ public class TelepathonRegistryTask implements Task {
      * its own synthetic "Telepathon Registry" Dene rather than a real device's.
      *
      * Also emits one EMERGENCY_ALERT_WORD_NAME word per device whose lateness
-     * status just transitioned into WARNING/CRITICAL (see evaluateLateness()) -
+     * status just transitioned into WARNING/CRITICAL (see evaluateDeviceStatuses()) -
      * Cerebellum.runRegistrySweep() pulls these out and calls publishEmergency()
      * with them rather than folding them into the ongoing status broadcast, so a
      * device that stays late doesn't re-alert on every 5-minute sweep.
@@ -225,15 +227,18 @@ public class TelepathonRegistryTask implements Task {
         JSONArray words = new JSONArray();
         Connection conn = PostgresqlPersistenceManager.instance().getConnection();
         try {
-            List<LateDevice> late = evaluateLateness(conn, nowEpochSec);
+            List<DeviceStatus> all = evaluateDeviceStatuses(conn, nowEpochSec);
+            List<DeviceStatus> late = new ArrayList<>();
             String worst = "OK";
-            for (LateDevice d : late) {
-                if ("CRITICAL".equals(d.status)) { worst = "CRITICAL"; break; }
-                if ("WARNING".equals(d.status)) worst = "WARNING";
+            for (DeviceStatus d : all) {
+                if (!"OK".equals(d.status)) late.add(d);
+                if ("CRITICAL".equals(d.status)) worst = "CRITICAL";
+                else if ("WARNING".equals(d.status) && !"CRITICAL".equals(worst)) worst = "WARNING";
             }
             words.put(deneWord("Telepathon Registry Status", worst, "String"));
-            words.put(deneWord("Telepathon Registry Late Devices", lateDevicesToJson(late), "String"));
-            for (LateDevice d : late) {
+            words.put(deneWord("Telepathon Registry Devices", devicesToJson(all), "String"));
+            words.put(deneWord("Telepathon Registry Late Devices", devicesToJson(late), "String"));
+            for (DeviceStatus d : late) {
                 if (!d.alertWorthy) continue;
                 String message = "Telepathon " + d.canonicalName + " has gone missing (no data for "
                         + (d.ageSec / 60) + " minutes)";
@@ -515,17 +520,24 @@ public class TelepathonRegistryTask implements Task {
 
     // ── Lateness ─────────────────────────────────────────────────────────────────
 
-    private static class LateDevice {
+    // Holds every registered device's current lateness status, not just late
+    // ones - sweep() filters this down for "Telepathon Registry Late Devices"
+    // and publishes the unfiltered form as "Telepathon Registry Devices" so a
+    // reader can see the whole registry, not just problem devices.
+    private static class DeviceStatus {
+        final String serialNumber;
         final String canonicalName;
         final String deviceType;
         final long ageSec;
         final String status;
         // True only when this sweep is what moved the device from its previously
-        // recorded alert status into this one (see evaluateLateness()) - the
-        // signal sweep() uses to decide which devices are worth an Emergency
+        // recorded alert status into this one (see evaluateDeviceStatuses()) -
+        // the signal sweep() uses to decide which devices are worth an Emergency
         // Channel publish, as opposed to a device that's simply still late.
         final boolean alertWorthy;
-        LateDevice(String canonicalName, String deviceType, long ageSec, String status, boolean alertWorthy) {
+        DeviceStatus(String serialNumber, String canonicalName, String deviceType, long ageSec,
+                     String status, boolean alertWorthy) {
+            this.serialNumber = serialNumber;
             this.canonicalName = canonicalName;
             this.deviceType = deviceType;
             this.ageSec = ageSec;
@@ -545,13 +557,14 @@ public class TelepathonRegistryTask implements Task {
         return "OK";
     }
 
-    // Also persists each device's computed status back to last_alert_status so
-    // the *next* sweep can tell a fresh transition (worth an emergency alert)
-    // apart from a device that's simply still late from before (not worth
-    // re-alerting on every 5-minute sweep) - see LateDevice.alertWorthy and
+    // Every registered device, regardless of status - also persists each
+    // device's computed status back to last_alert_status so the *next* sweep
+    // can tell a fresh transition (worth an emergency alert) apart from a
+    // device that's simply still late from before (not worth re-alerting on
+    // every 5-minute sweep) - see DeviceStatus.alertWorthy and
     // telepathon_registry.sql's column comment.
-    private List<LateDevice> evaluateLateness(Connection conn, long nowEpochSec) throws SQLException {
-        List<LateDevice> late = new ArrayList<>();
+    private List<DeviceStatus> evaluateDeviceStatuses(Connection conn, long nowEpochSec) throws SQLException {
+        List<DeviceStatus> all = new ArrayList<>();
         try (PreparedStatement select = conn.prepareStatement(
                 "SELECT serial_number, canonical_name, device_type, last_seen_epoch, last_alert_status "
                         + "FROM " + REGISTRY_TABLE + " WHERE teleonome_name = ?")) {
@@ -574,13 +587,11 @@ public class TelepathonRegistryTask implements Task {
                     // escalating within WARNING/CRITICAL.
                     boolean alertWorthy = statusChanged && !"OK".equals(status);
 
-                    if (!"OK".equals(status)) {
-                        late.add(new LateDevice(canonicalName, deviceType, ageSec, status, alertWorthy));
-                    }
+                    all.add(new DeviceStatus(serialNumber, canonicalName, deviceType, ageSec, status, alertWorthy));
                 }
             }
         }
-        return late;
+        return all;
     }
 
     private void updateAlertStatus(Connection conn, String serialNumber, String status) throws SQLException {
@@ -593,11 +604,12 @@ public class TelepathonRegistryTask implements Task {
         }
     }
 
-    private String lateDevicesToJson(List<LateDevice> late) {
+    private String devicesToJson(List<DeviceStatus> devices) {
         JSONArray arr = new JSONArray();
-        for (LateDevice d : late) {
+        for (DeviceStatus d : devices) {
             JSONObject o = new JSONObject();
             o.put("Name", d.canonicalName);
+            o.put("Serial Number", d.serialNumber);
             o.put("Device Type", d.deviceType);
             o.put("Seconds Since Last Seen", d.ageSec);
             o.put("Status", d.status);
