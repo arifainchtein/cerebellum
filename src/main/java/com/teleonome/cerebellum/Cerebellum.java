@@ -58,6 +58,13 @@ public class Cerebellum {
     private static final String TIMEZONE             = "Australia/Melbourne";
     private static final long   SUNSET_WINDOW_SECONDS = 1800; // ±30 min
 
+    // Marker value for a Cerebellum Task Dene's "Telepathon Type" DeneWord that means
+    // "this task reads the pulsing teleonome's own denome" (see Task.processSelf) rather
+    // than being matched against an incoming Telepathon. Not a DeneWord Type of its own -
+    // reuses the existing typed DeneWord so wiring a Self task looks identical to wiring
+    // a Telepathon-scoped one, just with this value.
+    private static final String TELEPATHON_TYPE_SELF = "Self";
+
     // Keyed by "className:deviceName" — tasks are long-lived, stateful instances.
     private final Map<String, Task>    taskRegistry       = new HashMap<>();
     // Epoch second of the last successful broadcast per task key.
@@ -268,10 +275,82 @@ public class Cerebellum {
                     }
                     logger.debug("line 147, taskDene=" + taskDene.getString(TeleonomeConstants.DENE_NAME_ATTRIBUTE));
                     // Get device name from the typed DeneWord
-                   
+
                     String taskTelepathonType = getDeneWordByType(taskDene,
                             TeleonomeConstants.DENEWORD_TYPE_CEREBELLUM_TELEPATHON_TYPE);
                     logger.debug("line 151, telepathonType=" +taskTelepathonType);
+
+                    // "Self" tasks read the pulsing teleonome's own denome (e.g. Ra's
+                    // house battery readings, or data pulled in from another teleonome
+                    // into Purpose:External Data) rather than an incoming Telepathon -
+                    // there's no Telepathon to match against, so skip that loop entirely
+                    // and hand the task the whole pulse via processSelf().
+                    if (TELEPATHON_TYPE_SELF.equals(taskTelepathonType)) {
+                        String expression = getDeneWordString(taskDene,
+                                TeleonomeConstants.DENEWORD_CEREBELLUM_EXPRESSION);
+                        if (expression != null && !expression.isEmpty()
+                                && !evaluateSelfExpression(expression, taskDene, pulse)) {
+                            logger.debug("Self expression '" + expression + "' false");
+                            continue;
+                        }
+
+                        String className = getDeneWordString(taskDene,
+                                TeleonomeConstants.DENEWORD_CEREBELLUM_TASK_TRUE_EXPRESSION);
+                        Task task = getOrCreateTask(className, teleonomeName);
+                        if (task == null) continue;
+
+                        String executionTime = getDeneWordString(taskDene,
+                                TeleonomeConstants.DENEWORD_CEREBELLUM_EXECUTION_TIME);
+                        String frequency = getDeneWordString(taskDene,
+                                TeleonomeConstants.DENEWORD_CEREBELLUM_EXECUTION_FREQUENCY);
+                        // matchExecutionSlot only dereferences its telepathon argument for
+                        // Sunset/Sunrise slots (Configuration:Latitude/longitude); null is
+                        // safe here since Self tasks don't have a telepathon to read that from.
+                        String matchedSlot = matchExecutionSlot(executionTime, frequency, null);
+                        if (matchedSlot == null) {
+                            logger.debug("No execution slot matched for " + task.getName() + "/Self");
+                            continue;
+                        }
+                        String trackingKey = className + ":" + teleonomeName + ":" + matchedSlot;
+                        if (!isFrequencyAllowed(trackingKey)) {
+                            logger.debug("Slot '" + matchedSlot + "' already ran today for "
+                                    + task.getName() + "/Self");
+                            continue;
+                        }
+                        lastExecutionEpoch.put(trackingKey, System.currentTimeMillis() / 1000);
+
+                        long startTime = System.currentTimeMillis();
+                        JSONArray words = task.processSelf(pulse, matchedSlot);
+                        long endTime = System.currentTimeMillis();
+                        if (words.length() == 0) continue;
+
+                        words.put(timingDeneWord(task.getName() + " Execution Time",
+                                String.valueOf(endTime), "Long"));
+                        words.put(timingDeneWord(task.getName() + " Duration",
+                                String.valueOf(endTime - startTime), "Integer"));
+
+                        String actionPointer = getDeneWordString(taskDene,
+                                TeleonomeConstants.DENEWORD_CEREBELLUM_ANNABELLE_ACTION_POINTER);
+                        if (actionPointer != null && !actionPointer.isEmpty()) {
+                            words.put(timingDeneWord(
+                                    TeleonomeConstants.DENEWORD_CEREBELLUM_ANNABELLE_ACTION_POINTER,
+                                    actionPointer, "String"));
+                        }
+
+                        latestTaskWords.put(teleonomeName + "|" + className, words);
+                        anyTaskFiredThisPulse = true;
+                        if (!TeleonomeConstants.DENEWORD_CEREBELLUM_EXECUTION_FREQUENCY_EVERY_PULSE
+                                .equals(frequency)) {
+                            slottedTaskFired = true;
+                        }
+
+                        logger.info("Task " + task.getName() + " for " + teleonomeName
+                                + " (Self) produced " + words.length() + " DeneWords in "
+                                + (endTime - startTime) + "ms");
+                        logger.debug(words.toString(4));
+                        continue;
+                    }
+
                     // Extract the device's current telepathon from the pulse
                     JSONArray telepathons = extractTelepathons(pulse);
                     JSONObject telepathon;
@@ -490,6 +569,46 @@ public class Cerebellum {
             return result instanceof Boolean && (Boolean) result;
         } catch (Exception e) {
             logger.warn("Expression evaluation error for '" + expression + "': " + e.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * Condition evaluator for Self tasks. Telepathon-scoped evaluateExpression()
+     * resolves a "Task Condition Pointer" as "@DeneName:DeneWordName" relative to
+     * one Telepathon's own Denes - there's no such fixed shape for a Self task, whose
+     * data can live anywhere in the teleonome's own tree (Purpose:Sensor Data,
+     * Purpose:External Data pulled in from another teleonome, Internal:Components,
+     * etc). So here the pointer is the full absolute path instead:
+     * "@Nucleus:DeneChain:Dene:DeneWord", e.g. "@Purpose:Sensor Data:Now:Battery State".
+     */
+    private boolean evaluateSelfExpression(String expression, JSONObject taskDene, JSONObject pulse) {
+        try {
+            JexlContext context = new MapContext();
+            JSONArray words = taskDene.getJSONArray("DeneWords");
+            for (int i = 0; i < words.length(); i++) {
+                JSONObject word = words.getJSONObject(i);
+                if (!TeleonomeConstants.DENEWORD_TYPE_CEREBELLUM_TASK_CONDITION_POINTER.equals(
+                        word.optString(TeleonomeConstants.DENEWORD_DENEWORD_TYPE_ATTRIBUTE))) {
+                    continue;
+                }
+                String varName = word.getString(TeleonomeConstants.DENEWORD_NAME_ATTRIBUTE);
+                String[] tokens = word.getString(TeleonomeConstants.DENEWORD_VALUE_ATTRIBUTE)
+                        .replace("@", "").split(":");
+                if (tokens.length != 4) {
+                    logger.warn("Self Task Condition Pointer '" + word.getString(TeleonomeConstants.DENEWORD_VALUE_ATTRIBUTE)
+                            + "' is not a full Nucleus:DeneChain:Dene:DeneWord path, skipping");
+                    continue;
+                }
+                Identity identity = new Identity(teleonomeName, tokens[0], tokens[1], tokens[2], tokens[3]);
+                Object value = DenomeUtils.getDeneWordByIdentity(pulse, identity, TeleonomeConstants.DENEWORD_VALUE_ATTRIBUTE);
+                if (value != null) context.set(varName, coerceJexlValue(value));
+            }
+            Expression expr = jexl.createExpression(expression);
+            Object result = expr.evaluate(context);
+            return result instanceof Boolean && (Boolean) result;
+        } catch (Exception e) {
+            logger.warn("Self expression evaluation error for '" + expression + "': " + e.getMessage());
             return false;
         }
     }
