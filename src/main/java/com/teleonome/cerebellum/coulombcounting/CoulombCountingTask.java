@@ -18,15 +18,22 @@ import java.util.TreeSet;
 
 /**
  * Purpose: independent coulomb counting for Ra's 48V/660Ah lead-acid bank, run
- * entirely inside the Teleonome rather than trusting the Selectronic SP PRO's own
- * reported totals - the SP PRO's own SoC/AmpHour counters are a separate, external
- * calculation that can drift over months without a full-charge resync, and the aging
- * bank makes that drift worth watching directly.
+ * entirely inside the Teleonome rather than trusting the PLSeries regulator's own
+ * reported totals - Now:Charge/Now:Load/Today:Charge/Today:Load/State of Charge
+ * all come from a Plasmatronics PL-series regulator read over serial by an Arduino
+ * (the "PLSeries MicroController"/"PLComm Sensor" in Internal:Components/Sensors),
+ * using its own shunt resistor for current sensing. This is NOT the Selectronic
+ * SP PRO inverter/charger itself - that's a separate device, captured separately
+ * (Purpose:Sensor Data:Selectronic, via camera/OCR of its display). The PLSeries
+ * regulator's own SoC/AmpHour counters are a separate, external calculation that
+ * can drift over months without a full-charge resync, and the aging bank makes
+ * that drift worth watching directly.
  *
- * Reads Ra's own Purpose:Sensor Data:Now:Charge/Load (amps, from the PLComm serial
- * sensor) every pulse ("Self" task - see Task.processSelf) and integrates net Ah
- * itself, then reports it alongside the SP PRO's own Today:Charge/Today:Load total
- * so drift between the two is directly visible.
+ * Reads Ra's own Purpose:Sensor Data:Now:Charge/Load (amps, from the PLSeries
+ * regulator's shunt, via its Arduino/PLComm serial link) every pulse ("Self" task
+ * - see Task.processSelf) and integrates net Ah itself, then reports it alongside
+ * the PLSeries regulator's own Today:Charge/Today:Load total so drift between the
+ * two is directly visible.
  *
  * netAhToday is a live in-memory accumulator, but it doesn't need its own persisted
  * ledger to survive a Cerebellum restart: Now:Charge/Now:Load are already remembered
@@ -64,6 +71,32 @@ public class CoulombCountingTask implements Task {
     @Override public String getName()       { return "CoulombCountingTask"; }
     @Override public String getDeviceName() { return deviceName; }
 
+    /**
+     * Output DeneWords, one row per pulse (published to Purpose:Cerebellum:Ra and
+     * shown on the Human Interface "Coulomb Counting" panel):
+     *
+     * <table border="1">
+     *   <tr><th>DeneWord</th><th>Type</th><th>Meaning</th></tr>
+     *   <tr><td>Coulomb Net AmpHours Today</td><td>double (Ah)</td>
+     *       <td>Cerebellum's own independently-integrated net Ah balance since local
+     *       midnight - trapezoidal integration of (Charge - Load) from Ra's own
+     *       Now:Charge/Now:Load readings each pulse. Positive = net charging,
+     *       negative = net discharging.</td></tr>
+     *   <tr><td>PLSeries Net AmpHours Today</td><td>double (Ah)</td>
+     *       <td>The PLSeries regulator's own reported net Ah today
+     *       (Today:Charge - Today:Load, its own internal tracking) - shown for
+     *       direct side-by-side comparison against Cerebellum's independent figure.</td></tr>
+     *   <tr><td>Coulomb Drift AmpHours</td><td>double (Ah)</td>
+     *       <td>Coulomb Net AmpHours Today minus PLSeries Net AmpHours Today.
+     *       The signal this task exists to catch - a growing drift over days means
+     *       the PLSeries regulator's internal counter is diverging from reality,
+     *       which coulomb counters do without periodic full-charge resync.</td></tr>
+     *   <tr><td>PLSeries State Of Charge</td><td>double (%)</td>
+     *       <td>Pass-through of the PLSeries regulator's own live State of Charge
+     *       (Now:State of Charge), included for context alongside the drift figures
+     *       without needing to cross-reference the Now panel.</td></tr>
+     * </table>
+     */
     @Override
     public JSONArray processSelf(JSONObject pulse, String matchedSlot) throws Exception {
         resetOrBootstrapForNewDay(pulse);
@@ -96,22 +129,22 @@ public class CoulombCountingTask implements Task {
         lastPulseMillis = nowMillis;
         lastNetAmps = netAmps;
 
-        double spProChargeToday = getSelfDouble(pulse, "Today", "Charge");
-        double spProLoadToday   = getSelfDouble(pulse, "Today", "Load");
-        double spProNetToday    = spProChargeToday - spProLoadToday;
-        double driftAh          = netAhToday - spProNetToday;
-        double spProSoc         = getSelfDouble(pulse, "Now", "State of Charge");
+        double plSeriesChargeToday = getSelfDouble(pulse, "Today", "Charge");
+        double plSeriesLoadToday   = getSelfDouble(pulse, "Today", "Load");
+        double plSeriesNetToday    = plSeriesChargeToday - plSeriesLoadToday;
+        double driftAh             = netAhToday - plSeriesNetToday;
+        double plSeriesSoc         = getSelfDouble(pulse, "Now", "State of Charge");
 
         logger.debug("CoulombCountingTask[" + deviceName + "]: V=" + voltage
                 + " Charge=" + charge + "A Load=" + load + "A netAhToday="
-                + round2(netAhToday) + " spProNetToday=" + round2(spProNetToday)
+                + round2(netAhToday) + " plSeriesNetToday=" + round2(plSeriesNetToday)
                 + " driftAh=" + round2(driftAh));
 
         JSONArray words = new JSONArray();
-        words.put(deneWord("Coulomb Net AmpHours Today", round2(netAhToday), "double"));
-        words.put(deneWord("Selectronic Net AmpHours Today", round2(spProNetToday), "double"));
-        words.put(deneWord("Coulomb Drift AmpHours", round2(driftAh), "double"));
-        words.put(deneWord("Coulomb Selectronic State Of Charge", spProSoc, "double"));
+        words.put(deneWord("Coulomb Net AmpHours Today", round2(netAhToday), "double", "Ah"));
+        words.put(deneWord("PLSeries Net AmpHours Today", round2(plSeriesNetToday), "double", "Ah"));
+        words.put(deneWord("Coulomb Drift AmpHours", round2(driftAh), "double", "Ah"));
+        words.put(deneWord("PLSeries State Of Charge", plSeriesSoc, "double", "%"));
         return words;
     }
 
@@ -219,6 +252,12 @@ public class CoulombCountingTask implements Task {
         } catch (Exception e) {
             return 0.0;
         }
+    }
+
+    private JSONObject deneWord(String name, Object value, String valueType, String units) {
+        JSONObject w = deneWord(name, value, valueType);
+        w.put("Units", units);
+        return w;
     }
 
     private JSONObject deneWord(String name, Object value, String valueType) {

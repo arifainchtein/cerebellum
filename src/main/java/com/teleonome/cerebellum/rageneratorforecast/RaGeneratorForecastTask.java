@@ -42,10 +42,12 @@ import static com.teleonome.cerebellum.rageneratorforecast.RaNightModel.*;
  *      time*, not just a yes/no by sunrise.
  *   2. Historical-load layer: average net Amps (Charge - Load) over the same
  *      sunset->sunrise window on each of the last few nights, projected forward
- *      as Ah against the 660Ah capacity, anchored to the SP PRO's current State
- *      of Charge. Slower-moving and less reactive than Layer 1, but far more
- *      stable for a multi-hour-ahead projection than extrapolating a single
- *      noisy trailing hour all the way to sunrise.
+ *      as Ah against the 660Ah capacity, anchored to the PLSeries regulator's
+ *      current State of Charge (Now:State of Charge - from the Plasmatronics
+ *      PL-series regulator's own shunt-based tracking, not the Selectronic SP
+ *      PRO). Slower-moving and less reactive than Layer 1, but far more stable
+ *      for a multi-hour-ahead projection than extrapolating a single noisy
+ *      trailing hour all the way to sunrise.
  *
  * Both layers read from Postgres's remembereddenewords_YYYY_M_D tables (queried
  * via PostgresqlPersistenceManager.instance(), a JVM-wide singleton) rather than
@@ -86,6 +88,40 @@ public class RaGeneratorForecastTask implements Task {
     @Override public String getName()       { return "RaGeneratorForecastTask"; }
     @Override public String getDeviceName() { return deviceName; }
 
+    /**
+     * Output DeneWords, one row per pulse (published to Purpose:Cerebellum:Ra and
+     * shown on the Human Interface "Ra Generator Forecast" panel):
+     *
+     * <table border="1">
+     *   <tr><th>DeneWord</th><th>Type</th><th>Meaning</th></tr>
+     *   <tr><td>Generator Needed Tonight</td><td>boolean</td>
+     *       <td>The overall recommendation - true if either the voltage-trend layer
+     *       or the historical-load layer projects trouble before sunrise, or if the
+     *       fast path already caught the answer before either layer even runs. The
+     *       one field to actually check.</td></tr>
+     *   <tr><td>Generator Forecast Trigger</td><td>String</td>
+     *       <td>Which layer(s) produced the recommendation: "None", "Voltage",
+     *       "SoC", "Both", or "None (Generator Serving Load)" if the fast path
+     *       caught that the generator is already running.</td></tr>
+     *   <tr><td>Voltage Floor Crossing Time Estimate</td><td>String</td>
+     *       <td>If the last hour's voltage trend is declining, the estimated local
+     *       time it crosses the 45.6V floor, extrapolated forward. "N/A" if voltage
+     *       isn't currently declining, or the floor won't be reached before sunrise.</td></tr>
+     *   <tr><td>Projected Sunrise Voltage</td><td>double (V)</td>
+     *       <td>The voltage-trend layer's straight-line extrapolation of current
+     *       voltage to sunrise, based on the last hour's empirical V/hr slope.</td></tr>
+     *   <tr><td>Projected Sunrise SoC %</td><td>double (%)</td>
+     *       <td>The historical-load layer's projection: current State of Charge
+     *       (from the PLSeries regulator, not the Selectronic SP PRO) adjusted by
+     *       the average net Amps drawn over the same sunset-&gt;sunrise window on
+     *       the last {@link RaNightModel#NIGHTS_TO_AVERAGE} nights, projected
+     *       forward against the 660Ah capacity.</td></tr>
+     *   <tr><td>Average Night Load Net Amps</td><td>double (A)</td>
+     *       <td>The historical average net Amps (Charge - Load) driving the SoC
+     *       projection above, shown for transparency so the assumption behind that
+     *       number is visible, not just its result.</td></tr>
+     * </table>
+     */
     @Override
     public JSONArray processSelf(JSONObject pulse, String matchedSlot) throws Exception {
         double voltage = getSelfDouble(pulse, "Battery Voltage");
@@ -108,8 +144,8 @@ public class RaGeneratorForecastTask implements Task {
             JSONArray words = new JSONArray();
             words.put(deneWord("Generator Needed Tonight", false, "boolean"));
             words.put(deneWord("Generator Forecast Trigger", "None (Generator Serving Load)", "String"));
-            words.put(deneWord("Projected Sunrise Voltage", round2(voltage), "double"));
-            words.put(deneWord("Projected Sunrise SoC %", round2(soc), "double"));
+            words.put(deneWord("Projected Sunrise Voltage", round2(voltage), "double", "Volts"));
+            words.put(deneWord("Projected Sunrise SoC %", round2(soc), "double", "%"));
             return words;
         }
 
@@ -159,9 +195,9 @@ public class RaGeneratorForecastTask implements Task {
         words.put(deneWord("Generator Needed Tonight", generatorNeeded, "boolean"));
         words.put(deneWord("Generator Forecast Trigger", trigger, "String"));
         words.put(deneWord("Voltage Floor Crossing Time Estimate", crossingTime, "String"));
-        words.put(deneWord("Projected Sunrise Voltage", round2(projectedVoltage), "double"));
-        words.put(deneWord("Projected Sunrise SoC %", round2(projectedSoc), "double"));
-        words.put(deneWord("Average Night Load Net Amps", round2(avgNetAmps), "double"));
+        words.put(deneWord("Projected Sunrise Voltage", round2(projectedVoltage), "double", "Volts"));
+        words.put(deneWord("Projected Sunrise SoC %", round2(projectedSoc), "double", "%"));
+        words.put(deneWord("Average Night Load Net Amps", round2(avgNetAmps), "double", "Amperes"));
         return words;
     }
 
@@ -195,6 +231,12 @@ public class RaGeneratorForecastTask implements Task {
         } catch (Exception e) {
             return 0.0;
         }
+    }
+
+    private JSONObject deneWord(String name, Object value, String valueType, String units) {
+        JSONObject w = deneWord(name, value, valueType);
+        w.put("Units", units);
+        return w;
     }
 
     private JSONObject deneWord(String name, Object value, String valueType) {
