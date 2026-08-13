@@ -17,11 +17,11 @@ import static com.teleonome.cerebellum.rageneratorforecast.RaNightModel.*;
 
 /**
  * Purpose: decide whether Ra's generator needs to run overnight to keep the
- * 48V/660Ah lead-acid bank above its 45.6V floor by sunrise. Unlike the other
+ * 48V/660Ah lead-acid bank above its 46.4V floor by sunrise. Unlike the other
  * teleonomes on this framework (solar + battery only), Ra also has a generator
  * input that can charge overnight - this task exists to answer "does someone
  * need to go start it" before the bank actually gets there, not just report a
- * forecast number. Named/packaged for Ra specifically since the 45.6V floor and
+ * forecast number. Named/packaged for Ra specifically since the 46.4V floor and
  * the overnight-generator premise are this system's own spec, not a general
  * pattern other teleonomes share.
  *
@@ -30,13 +30,23 @@ import static com.teleonome.cerebellum.rageneratorforecast.RaNightModel.*;
  * ~400m - the SunriseSunsetCalculator library doesn't model altitude, but at
  * 400m that's a ~2-3 minute effect, not worth a custom calculation for).
  *
+ * IMPORTANT: "sunset->sunrise" is the framing for Layers 1 and 2 below (they
+ * project *future* overnight risk), but the actual floor check is NOT confined
+ * to nighttime - see the unconditional emergency check in processSelf(), added
+ * 2026-08-12 after a real miss: on a weak-sun day the battery can sit right at
+ * 46.4V at midday (still net-discharging, just more slowly than overnight)
+ * without either layer below ever tripping, since Layer 1 only fires on a
+ * *declining* trend and Layer 2 only ever looks at nighttime history projected
+ * to the *next* sunrise. The emergency check catches "already at the floor
+ * right now," any time of day, independent of both layers.
+ *
  * Two independent layers, either of which can trigger the recommendation - not
  * one merged model - because a single estimator's blind spot shouldn't be able
  * to silently mask real risk on an aging bank. They're deliberately built on
  * different bases so they fail independently:
  *
  *   1. Voltage-trend layer: empirical V/hr slope from the last hour of actual
- *      readings, extrapolated to sunrise against the 45.6V floor. Fast/reactive
+ *      readings, extrapolated to sunrise against the 46.4V floor. Fast/reactive
  *      - reflects whatever's happening right now (a load spike, cloud cover,
  *      the generator already running) - and also yields an estimated *crossing
  *      time*, not just a yes/no by sunrise.
@@ -68,7 +78,7 @@ import static com.teleonome.cerebellum.rageneratorforecast.RaNightModel.*;
  */
 public class RaGeneratorForecastTask implements Task {
 
-    private static final double MIN_SAFE_VOLTAGE     = 45.6;
+    private static final double MIN_SAFE_VOLTAGE     = 46.4;
     private static final long   VOLTAGE_TREND_WINDOW_MILLIS = 60 * 60_000L; // trailing 1h
     private static final double LOAD_NEAR_ZERO_AMPS  = 0.5;  // sensor noise tolerance around 0A
 
@@ -105,7 +115,7 @@ public class RaGeneratorForecastTask implements Task {
      *       caught that the generator is already running.</td></tr>
      *   <tr><td>Voltage Floor Crossing Time Estimate</td><td>String</td>
      *       <td>If the last hour's voltage trend is declining, the estimated local
-     *       time it crosses the 45.6V floor, extrapolated forward. "N/A" if voltage
+     *       time it crosses the 46.4V floor, extrapolated forward. "N/A" if voltage
      *       isn't currently declining, or the floor won't be reached before sunrise.</td></tr>
      *   <tr><td>Projected Sunrise Voltage</td><td>double (V)</td>
      *       <td>The voltage-trend layer's straight-line extrapolation of current
@@ -133,17 +143,37 @@ public class RaGeneratorForecastTask implements Task {
         double load = getSelfDouble(pulse, "Load");
         long nowMillis = pulse.optLong("Pulse Timestamp in Milliseconds", System.currentTimeMillis());
 
+        // Unconditional emergency check: is the battery already at or below the floor
+        // RIGHT NOW, this pulse - independent of trend direction or time of day. Layers
+        // 1 and 2 below only ever look at *projected future* risk (sunset->sunrise):
+        // Layer 1 only extrapolates when the last-hour trend is declining, so a flat
+        // trend sitting right on 46.4V (e.g. weak midday sun barely balancing load)
+        // never trips it; Layer 2 only ever uses nighttime historical averages
+        // projected to the *next* sunrise, so it's blind at midday entirely. Both
+        // layers implicitly assume "the risk is tonight" - this catches the case
+        // where the risk is already here, any time of day. Checked first, ahead of
+        // the fast path, since a low-voltage fact right now matters regardless of why.
+        boolean voltageAtOrBelowFloorNow = voltage <= MIN_SAFE_VOLTAGE;
+
         // Fast path: on this system, Load reads ~0 whenever the generator is running,
         // because the generator serves house load directly rather than the battery
         // supplying it (confirmed by Ari - matches Ra's own dormant "Current Load
         // Condition" actuator, which already used Load==0 as this exact signal).
         // Both layers below are lagging windows, so they'd take a while to recognize
-        // the generator has fixed things - this catches it immediately instead.
+        // the generator has fixed things - this catches it immediately instead. But if
+        // voltage hasn't actually recovered above the floor yet, don't clear the alarm
+        // just because something is currently drawing Load down to ~0 - Load~0 alone
+        // doesn't prove the battery has recovered, only that it isn't being drawn down
+        // *right now*.
         if (load <= LOAD_NEAR_ZERO_AMPS) {
-            logger.debug("RaGeneratorForecastTask: Load=" + load + "A (~0) - generator serving load directly, no risk");
+            logger.debug("RaGeneratorForecastTask: Load=" + load + "A (~0) - generator/solar serving load directly"
+                    + (voltageAtOrBelowFloorNow ? ", but voltage still at/below floor" : ", no risk"));
             JSONArray words = new JSONArray();
-            words.put(deneWord("Generator Needed Tonight", false, "boolean"));
-            words.put(deneWord("Generator Forecast Trigger", "None (Generator Serving Load)", "String"));
+            words.put(deneWord("Generator Needed Tonight", voltageAtOrBelowFloorNow, "boolean"));
+            words.put(deneWord("Generator Forecast Trigger",
+                    voltageAtOrBelowFloorNow ? "Voltage (At Or Below Floor Now)" : "None (Generator Serving Load)",
+                    "String"));
+            words.put(deneWord("Voltage Floor Crossing Time Estimate", voltageAtOrBelowFloorNow ? "Now" : "N/A", "String"));
             words.put(deneWord("Projected Sunrise Voltage", round2(voltage), "double", "Volts"));
             words.put(deneWord("Projected Sunrise SoC %", round2(soc), "double", "%"));
             return words;
@@ -180,8 +210,9 @@ public class RaGeneratorForecastTask implements Task {
             socLayerTriggered = projectedSoc <= 0;
         }
 
-        boolean generatorNeeded = voltageLayerTriggered || socLayerTriggered;
-        String trigger = voltageLayerTriggered && socLayerTriggered ? "Both"
+        boolean generatorNeeded = voltageAtOrBelowFloorNow || voltageLayerTriggered || socLayerTriggered;
+        String trigger = voltageAtOrBelowFloorNow ? "Voltage (At Or Below Floor Now)"
+                : voltageLayerTriggered && socLayerTriggered ? "Both"
                 : voltageLayerTriggered ? "Voltage"
                 : socLayerTriggered ? "SoC"
                 : "None";
@@ -203,15 +234,35 @@ public class RaGeneratorForecastTask implements Task {
 
     // ── Trend helpers ─────────────────────────────────────────────────────────
 
-    /** Slope in units-per-hour between the oldest and newest row in a getRemeberedDeneWordStart() result. */
+    /**
+     * Least-squares slope in units-per-hour across every row in a
+     * getRemeberedDeneWordStart() result - a regression over the whole window, not
+     * just the oldest/newest two points. Battery Voltage on Ra is quantized to
+     * ~0.4V steps by the sensor, so a naive two-point slope is extremely noisy:
+     * which exact quantization step the window's two boundary samples happen to
+     * land on varies almost randomly pulse to pulse, which was observed swinging
+     * the projected crossing time by hours between consecutive one-minute pulses
+     * with the voltage barely moving (2026-08-13). Fitting a line through all ~60
+     * samples in the window averages that quantization noise out.
+     */
     private double slope(JSONArray history) {
-        if (history.length() < 2) return 0;
-        JSONObject first = history.getJSONObject(0);
-        JSONObject last  = history.getJSONObject(history.length() - 1);
-        double dtHours = (last.getLong("Pulse Timestamp in Milliseconds")
-                - first.getLong("Pulse Timestamp in Milliseconds")) / 3_600_000.0;
-        if (dtHours <= 0) return 0;
-        return (last.getDouble("Value") - first.getDouble("Value")) / dtHours;
+        int n = history.length();
+        if (n < 2) return 0;
+
+        long t0 = history.getJSONObject(0).getLong("Pulse Timestamp in Milliseconds");
+        double sumT = 0, sumV = 0, sumTV = 0, sumTT = 0;
+        for (int i = 0; i < n; i++) {
+            JSONObject row = history.getJSONObject(i);
+            double tHours = (row.getLong("Pulse Timestamp in Milliseconds") - t0) / 3_600_000.0;
+            double v = row.getDouble("Value");
+            sumT += tHours;
+            sumV += v;
+            sumTV += tHours * v;
+            sumTT += tHours * tHours;
+        }
+        double denominator = n * sumTT - sumT * sumT;
+        if (denominator == 0) return 0;
+        return (n * sumTV - sumT * sumV) / denominator;
     }
 
     private double round2(double v) {
