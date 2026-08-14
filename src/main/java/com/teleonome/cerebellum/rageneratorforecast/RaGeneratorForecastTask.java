@@ -130,6 +130,19 @@ public class RaGeneratorForecastTask implements Task {
      *       <td>The historical average net Amps (Charge - Load) driving the SoC
      *       projection above, shown for transparency so the assumption behind that
      *       number is visible, not just its result.</td></tr>
+     *   <tr><td>Time at Solar Start</td><td>String</td>
+     *       <td>Estimated local time the panels actually start harvesting today -
+     *       i.e. when Charge first reaches 1A - based on the most recent day's
+     *       observed first-charge time, NOT astronomical sunrise (sunrise is when
+     *       the sun comes up; solar start is when the panels actually start
+     *       producing, which can trail sunrise by an hour or more). "N/A" if no
+     *       recent day has an observed solar start to base the estimate on.</td></tr>
+     *   <tr><td>Voltage at Solar Start</td><td>double (V)</td>
+     *       <td>The voltage-trend layer's straight-line extrapolation of current
+     *       voltage to the estimated solar start time above, using the same
+     *       last-hour empirical V/hr slope as Projected Sunrise Voltage. Falls back
+     *       to current voltage if the trend isn't declining or solar start couldn't
+     *       be estimated.</td></tr>
      * </table>
      */
     @Override
@@ -155,6 +168,10 @@ public class RaGeneratorForecastTask implements Task {
         // the fast path, since a low-voltage fact right now matters regardless of why.
         boolean voltageAtOrBelowFloorNow = voltage <= MIN_SAFE_VOLTAGE;
 
+        PostgresqlPersistenceManager db = PostgresqlPersistenceManager.instance();
+        long solarStartMillis = nextSolarStartMillis(db, nowMillis);
+        String solarStartTime = solarStartMillis > 0 ? timeFormatter.format(solarStartMillis) : "N/A";
+
         // Fast path: on this system, Load reads ~0 whenever the generator is running,
         // because the generator serves house load directly rather than the battery
         // supplying it (confirmed by Ari - matches Ra's own dormant "Current Load
@@ -176,13 +193,13 @@ public class RaGeneratorForecastTask implements Task {
             words.put(deneWord("Voltage Floor Crossing Time Estimate", voltageAtOrBelowFloorNow ? "Now" : "N/A", "String"));
             words.put(deneWord("Projected Sunrise Voltage", round2(voltage), "double", "Volts"));
             words.put(deneWord("Projected Sunrise SoC %", round2(soc), "double", "%"));
+            words.put(deneWord("Time at Solar Start", solarStartTime, "String"));
+            words.put(deneWord("Voltage at Solar Start", round2(voltage), "double", "Volts"));
             return words;
         }
 
         long sunriseMillis = nextSunriseMillis(nowMillis);
         double hoursToSunrise = (sunriseMillis - nowMillis) / 3_600_000.0;
-
-        PostgresqlPersistenceManager db = PostgresqlPersistenceManager.instance();
 
         // ── Layer 1: voltage slope, from remembered Battery Voltage history ────
         double voltageSlopePerHour = slope(
@@ -198,6 +215,14 @@ public class RaGeneratorForecastTask implements Task {
             if (hoursToFloor >= 0 && hoursToFloor <= hoursToSunrise) {
                 crossingTime = timeFormatter.format(nowMillis + (long) (hoursToFloor * 3_600_000.0));
             }
+        }
+
+        // Same slope, extrapolated to the estimated solar-start time instead of
+        // sunrise - see class doc for why the two differ.
+        double projectedSolarStartVoltage = voltage;
+        if (solarStartMillis > 0 && voltageSlopePerHour < 0) {
+            double hoursToSolarStart = (solarStartMillis - nowMillis) / 3_600_000.0;
+            projectedSolarStartVoltage = voltage + voltageSlopePerHour * hoursToSolarStart;
         }
 
         // ── Layer 2: average historical night load, sunset->sunrise, last few nights ─
@@ -229,6 +254,8 @@ public class RaGeneratorForecastTask implements Task {
         words.put(deneWord("Projected Sunrise Voltage", round2(projectedVoltage), "double", "Volts"));
         words.put(deneWord("Projected Sunrise SoC %", round2(projectedSoc), "double", "%"));
         words.put(deneWord("Average Night Load Net Amps", round2(avgNetAmps), "double", "Amperes"));
+        words.put(deneWord("Time at Solar Start", solarStartTime, "String"));
+        words.put(deneWord("Voltage at Solar Start", round2(projectedSolarStartVoltage), "double", "Volts"));
         return words;
     }
 
