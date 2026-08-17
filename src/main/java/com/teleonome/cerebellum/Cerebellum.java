@@ -8,6 +8,7 @@ import com.teleonome.framework.utils.Utils;
 import com.teleonome.framework.denome.DenomeUtils;
 import com.teleonome.framework.denome.Identity;
 import com.teleonome.cerebellum.telepathonregistry.TelepathonRegistryTask;
+import com.teleonome.cerebellum.hypothalamusmonitoring.HypothalamusMonitoringTask;
 
 import org.apache.commons.io.FileUtils;
 import org.apache.commons.jexl2.*;
@@ -37,6 +38,10 @@ public class Cerebellum {
     // can notice a device that has stopped pulsing entirely, which a pulse-driven
     // Task structurally never can.
     private static final long   REGISTRY_SWEEP_INTERVAL_MS = 5 * 60_000;
+    // Same time-based split as REGISTRY_SWEEP_INTERVAL_MS above - drives
+    // HypothalamusMonitorThread, which checks lastPulseMillis for an outage the
+    // heartbeat itself going silent can never trigger a pulse-driven check for.
+    private static final long   HYPOTHALAMUS_MONITOR_INTERVAL_MS = 3 * 60_000;
 
     private MqttClient client;
     // Separate connection dedicated to Hippocampus request/response. Kept apart
@@ -51,7 +56,11 @@ public class Cerebellum {
     private Logger logger;
     private final int pid;
     private String teleonomeName;
-    private long lastPulseMillis;
+    // volatile: written on the MQTT callback thread (absorbPulse) but now also
+    // read from HypothalamusMonitorThread - a plain long isn't guaranteed to be
+    // read/written atomically across threads without this.
+    private volatile long lastPulseMillis;
+    private HypothalamusMonitoringTask hypothalamusMonitoringTask;
 
     private final JexlEngine jexl = new JexlEngine();
 
@@ -150,6 +159,7 @@ public class Cerebellum {
 
         new PingThread().start();
         new RegistrySweepThread().start();
+        new HypothalamusMonitorThread().start();
     }
 
     private void startHippocampusClient() throws MqttException {
@@ -1008,5 +1018,56 @@ public class Cerebellum {
         // to a specific device the way pulse-triggered Task output is.
         latestTaskWords.put("Telepathon Registry|TelepathonRegistryTask", statusWords);
         broadcastAnalysis(buildCerebellumDeneChain(mergeLatestTaskWords(), nowEpochSec));
+    }
+
+    // ── Hypothalamus monitor thread ───────────────────────────────────────────
+
+    private class HypothalamusMonitorThread extends Thread {
+        HypothalamusMonitorThread() { setDaemon(true); setName("CerebellumHypothalamusMonitor"); }
+
+        @Override
+        public void run() {
+            while (true) {
+                try { Thread.sleep(HYPOTHALAMUS_MONITOR_INTERVAL_MS); } catch (InterruptedException e) { e.printStackTrace(); }
+                try {
+                    runHypothalamusMonitorSweep();
+                } catch (Exception e) {
+                    logger.warn("HypothalamusMonitorThread: sweep failed: " + Utils.getStringException(e));
+                }
+            }
+        }
+    }
+
+    // teleonomeName is only known after absorbPulse() sees its first Status pulse -
+    // nothing to evaluate against until then (same guard as runRegistrySweep()).
+    private void runHypothalamusMonitorSweep() {
+        if (teleonomeName == null) {
+            logger.debug("HypothalamusMonitorThread: teleonomeName not yet known, skipping this cycle");
+            return;
+        }
+        if (hypothalamusMonitoringTask == null) {
+            hypothalamusMonitoringTask = new HypothalamusMonitoringTask(teleonomeName);
+        }
+        long nowMillis = System.currentTimeMillis();
+        JSONArray words = hypothalamusMonitoringTask.sweep(nowMillis, lastPulseMillis);
+        if (words.length() == 0) return;
+
+        // Emergency-alert word is a one-shot event for publishEmergency(), not part
+        // of the ongoing status broadcast - same convention as runRegistrySweep()
+        // above (see HypothalamusMonitoringTask.EMERGENCY_ALERT_WORD_NAME).
+        JSONArray statusWords = new JSONArray();
+        for (int i = 0; i < words.length(); i++) {
+            JSONObject word = words.getJSONObject(i);
+            if (HypothalamusMonitoringTask.EMERGENCY_ALERT_WORD_NAME.equals(word.optString("Name"))) {
+                publishEmergency("Cerebellum", word.optString("Value"));
+            } else {
+                statusWords.put(word);
+            }
+        }
+
+        // Synthetic Dene name, distinct from any real device - same reasoning as
+        // "Telepathon Registry" above (this isn't attached to any one Telepathon).
+        latestTaskWords.put("Hypothalamus Monitoring|HypothalamusMonitoringTask", statusWords);
+        broadcastAnalysis(buildCerebellumDeneChain(mergeLatestTaskWords(), nowMillis / 1000));
     }
 }

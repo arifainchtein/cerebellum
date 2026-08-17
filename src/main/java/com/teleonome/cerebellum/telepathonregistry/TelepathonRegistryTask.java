@@ -41,12 +41,16 @@ import java.util.Map;
  * that gap with a registry that never forgets a serial number, persisted in
  * Postgres instead of the live (self-pruning) denome.
  *
- * Identity policy (ASSUMPTION - not yet confirmed): sticky / first-seen-wins. The
- * name already on record for a serial number is treated as the true canonical name;
- * any later arrival under a different name for the same serial is flagged as a
- * mismatch to correct, never used to overwrite the canonical name. This mirrors
- * AnnabelleReader's existing getKnownNameForSerial() guard. If the real tie-break
- * rule should be different, decideReconciliation() below is the one method to change.
+ * Identity policy (ASSUMPTION - not yet confirmed): sticky / first-seen-wins for
+ * the serial->name ledger specifically (upsertLedger()). The name already on
+ * record for a serial number is treated as the true canonical name; any later
+ * arrival under a different name for the same serial is flagged as a mismatch to
+ * correct, never used to overwrite the canonical name. This mirrors
+ * AnnabelleReader's existing getKnownNameForSerial() guard. Note this sticky
+ * policy applies only to that direction (same serial, new name) - the opposite
+ * direction (same name, new serial) is deliberately NOT first-seen-wins; see the
+ * official/temporary-list curation described further down, which exists
+ * specifically to avoid that weakness.
  * The same first-seen-wins weakness applies here too: whichever corrupted variant
  * happens to arrive first becomes "canonical" - the registry has no way to know
  * "Chinampa" is the clean name and "WestLWES"/"ghSUMP" aren't, if WestLWES (the
@@ -92,11 +96,64 @@ import java.util.Map;
  * Task Dene per Device Type Id (Daffodil, Langley, Gloria, Chinampa, ...), all
  * pointing at this same class name, in each host's live Teleonome.denome (same
  * "no version-controlled template" caveat as LangleyTopologyTask - see BACKGROUND.md).
+ *
+ * Curation (added after the "six FISH Daffodils" bug - ChinampaMonitor had one
+ * real FISH/Daffodil and five bogus ones, all showing in the webapp's Registry
+ * Status popup because sweep() used to list every row of telepathon_registry -
+ * one row per distinct serial number EVER reported under that name, with no
+ * de-duplication at all): a reported (name, device_type) identity is no longer
+ * trusted as "official" - and therefore no longer shown to the webapp - just
+ * because a pulse said so. It must be confirmed by one of two independent,
+ * deliberately redundant paths, both implemented below:
+ *
+ *   1. reconcileFromHistory() - queries every historical telepathon_YYYY_M_D
+ *      reading for this reported name (PostgresqlPersistenceManager.
+ *      getTelepathonDataStart(), same helper LangleySilenceSweep uses), tallies
+ *      Serial Number occurrences restricted to this device_type, and promotes
+ *      the serial if it's a clear (>50%) majority. This is what self-heals an
+ *      already-broken registry like the six-FISH case within one sweep, without
+ *      waiting on new pulses.
+ *   2. checkPromotion() - a live, forward-looking signal for genuinely new
+ *      devices: an unconfirmed (name, device_type, serial) triple accumulates in
+ *      the "temporary list" (telepathon_registry_pending) across pulses, and
+ *      only gets promoted once it recurs "Promotion Threshold"-or-more times.
+ *      This exists specifically to defeat the old first-seen-wins flaw - if the
+ *      very first telepathon ever received for a name has a corrupted/wrong
+ *      serial number, first-seen-wins would lock that in forever (the registry
+ *      never forgets). Requiring recurrence means a one-off bad reading can't
+ *      become "official" by itself.
+ *
+ * Pending rows older than "Days in Temporary List" days are purged
+ * (purgeStalePending()) before every promotion check, so a single corrupted
+ * reading can't sit accumulating count indefinitely. Both "Days in Temporary
+ * List" and "Promotion Threshold" are DeneWords under
+ * Internal:Cerebellum:Configuration in the live Teleonome.denome - see
+ * CerebellumConfigClient for the exact shape and defaults (7 days / 3
+ * occurrences) used when that Dene is missing or unreachable.
+ *
+ * telepathon_registry (the original table) keeps its original job as a raw,
+ * never-forgets ledger keyed by serial_number - upsertLedger() still uses it for
+ * the original TopTank/TOPT rename-detection case (same serial, new reported
+ * name). telepathon_registry_official is the new, curated, de-duplicated table -
+ * at most one row per (canonical_name, device_type) - that sweep() now reads for
+ * the webapp. See telepathon_registry.sql for both new tables' schema/comments.
  */
 public class TelepathonRegistryTask implements Task {
 
     private static final String REGISTRY_TABLE = "telepathon_registry";
+    private static final String OFFICIAL_TABLE = "telepathon_registry_official";
+    private static final String PENDING_TABLE  = "telepathon_registry_pending";
     private static final String PROFILE_TABLE  = "telepathon_profile";
+
+    // How far back reconcileFromHistory() scans telepathon_YYYY_M_D tables when
+    // tallying Serial Number occurrences for a reported name - generous enough to
+    // catch a majority even for a device that pulses rarely, without scanning the
+    // database's entire history on every unresolved pulse.
+    private static final long HISTORY_LOOKBACK_DAYS = 90;
+
+    // Shared across every per-device instance (same rationale as FACTORY_CLIENT
+    // below) - one HttpClient, cached per-teleonome, not one per device.
+    private static final CerebellumConfigClient CONFIG_CLIENT = new CerebellumConfigClient();
 
     // DeneWord name Cerebellum.runRegistrySweep() watches for and pulls out of
     // sweep()'s returned words to hand to publishEmergency() - a one-shot event,
@@ -187,13 +244,14 @@ public class TelepathonRegistryTask implements Task {
 
         Connection conn = PostgresqlPersistenceManager.instance().getConnection();
         try {
+            CerebellumConfigClient.RegistryConfig config = CONFIG_CLIENT.get(teleonomeName);
             ReconcileOutcome outcome = reconcile(conn, serialNumber, reportedName, deviceType,
-                    groupIdentifier, latitude, longitude, rawData, nowEpochSec);
+                    groupIdentifier, latitude, longitude, rawData, nowEpochSec, config);
 
             words.put(deneWord("Telepathon Identity Status", outcome.status, "String"));
             words.put(deneWord("Telepathon Canonical Name", outcome.canonicalName, "String"));
             words.put(deneWord("Telepathon Serial Number", serialNumber, "String"));
-            if (outcome.mismatch) {
+            if (!"OK".equals(outcome.status)) {
                 words.put(deneWord("Telepathon Reported Name", reportedName, "String"));
             }
             if (outcome.possibleDuplicateOf != null) {
@@ -227,7 +285,16 @@ public class TelepathonRegistryTask implements Task {
         JSONArray words = new JSONArray();
         Connection conn = PostgresqlPersistenceManager.instance().getConnection();
         try {
+            CerebellumConfigClient.RegistryConfig config = CONFIG_CLIENT.get(teleonomeName);
+            // Run before evaluateDeviceStatuses() so a device that isn't currently
+            // pulsing (and therefore never calls process()/reconcile() itself) still
+            // gets resolved onto the official list within one sweep interval, not
+            // only when it happens to pulse again - see class javadoc.
+            purgeStalePending(conn, nowEpochSec, config.daysInTemporaryList);
+            reconcileAllPendingGroups(conn, nowEpochSec, config.promotionThreshold);
+
             List<DeviceStatus> all = evaluateDeviceStatuses(conn, nowEpochSec);
+            words.put(deneWord("Telepathon Registry Pending Devices", pendingToJson(conn), "String"));
             List<DeviceStatus> late = new ArrayList<>();
             String worst = "OK";
             for (DeviceStatus d : all) {
@@ -253,7 +320,8 @@ public class TelepathonRegistryTask implements Task {
     // ── Reconciliation ───────────────────────────────────────────────────────────
 
     private static class ReconcileOutcome {
-        final String status;         // "New" | "OK" | "Correction Needed" | "Possible Duplicate"
+        final String status;         // "OK" | "Correction Needed" | "Possible Duplicate" |
+                                      // "Pending - New" | "Pending - Serial Mismatch"
         final String canonicalName;
         final boolean mismatch;
         final String possibleDuplicateOf;  // non-null only when status == "Possible Duplicate"
@@ -266,18 +334,6 @@ public class TelepathonRegistryTask implements Task {
             this.mismatch = mismatch;
             this.possibleDuplicateOf = possibleDuplicateOf;
         }
-    }
-
-    // Pure decision, no DB access - kept separate from reconcile() so it can be
-    // exercised directly by a throwaway test driver without a live connection.
-    ReconcileOutcome decideReconciliation(String existingCanonicalNameOrNull, String reportedName) {
-        if (existingCanonicalNameOrNull == null) {
-            return new ReconcileOutcome("New", reportedName, false);
-        }
-        if (existingCanonicalNameOrNull.equals(reportedName)) {
-            return new ReconcileOutcome("OK", existingCanonicalNameOrNull, false);
-        }
-        return new ReconcileOutcome("Correction Needed", existingCanonicalNameOrNull, true);
     }
 
     // ── Secondary fingerprint match ─────────────────────────────────────────────
@@ -359,7 +415,71 @@ public class TelepathonRegistryTask implements Task {
 
     private ReconcileOutcome reconcile(Connection conn, String serialNumber, String reportedName,
                                         String deviceType, String groupIdentifier, Double latitude, Double longitude,
-                                        String rawData, long nowEpochSec) throws SQLException {
+                                        String rawData, long nowEpochSec,
+                                        CerebellumConfigClient.RegistryConfig config) throws SQLException {
+        // Ledger update - unchanged rename-detection behaviour, keyed by serial
+        // number (the original TopTank/TOPT case: same physical device, corrupted
+        // reported name). Independent of the name+type official/pending machinery
+        // below, which exists for the opposite bug (same reported name, several
+        // different serials).
+        String ledgerCanonicalName = upsertLedger(conn, serialNumber, reportedName, deviceType,
+                groupIdentifier, latitude, longitude, nowEpochSec);
+        boolean ledgerMismatch = ledgerCanonicalName != null && !ledgerCanonicalName.equals(reportedName);
+        if (ledgerMismatch) {
+            logger.warn("TelepathonRegistryTask: identity mismatch - serial='" + serialNumber
+                    + "' registered as '" + ledgerCanonicalName + "' but this pulse reports name='"
+                    + reportedName + "'. Raw Data: " + rawData);
+        }
+
+        ensureProfileDefaults(conn, serialNumber, deviceType);
+
+        String officialSerial = selectOfficialSerial(conn, reportedName, deviceType);
+        if (serialNumber.equals(officialSerial)) {
+            updateOfficialLastSeen(conn, reportedName, deviceType, nowEpochSec);
+            return ledgerMismatch
+                    ? new ReconcileOutcome("Correction Needed", ledgerCanonicalName, true)
+                    : new ReconcileOutcome("OK", reportedName, false);
+        }
+
+        // officialSerial is either null (no confirmed device behind this name+type
+        // yet) or disagrees with this pulse's serial - this pulse does not get to
+        // become official just by showing up (see class javadoc). It joins the
+        // temporary list instead, and every arrival re-runs both promotion checks.
+        upsertPending(conn, reportedName, deviceType, serialNumber, groupIdentifier, latitude, longitude, nowEpochSec);
+        purgeStalePending(conn, nowEpochSec, config.daysInTemporaryList);
+
+        String promoted = checkPromotion(conn, reportedName, deviceType, nowEpochSec, config.promotionThreshold);
+        if (promoted == null) {
+            promoted = reconcileFromHistory(conn, reportedName, deviceType, nowEpochSec);
+        }
+        if (promoted != null) {
+            return promoted.equals(serialNumber)
+                    ? new ReconcileOutcome("OK", reportedName, false)
+                    : new ReconcileOutcome("Correction Needed", reportedName, true);
+        }
+
+        String duplicateOf = matchFingerprint(deviceType, groupIdentifier, latitude, longitude,
+                loadFingerprintCandidates(conn, deviceType, serialNumber));
+        if (duplicateOf != null) {
+            logger.warn("TelepathonRegistryTask: possible duplicate - serial='" + serialNumber
+                    + "' name='" + reportedName + "' fingerprint-matches existing device '" + duplicateOf
+                    + "'. Raw Data: " + rawData);
+            return new ReconcileOutcome("Possible Duplicate", reportedName, false, duplicateOf);
+        }
+
+        logger.info("TelepathonRegistryTask: serial='" + serialNumber + "' name='" + reportedName
+                + "' type='" + deviceType + "' awaiting official confirmation (temporary list)");
+        return new ReconcileOutcome(officialSerial == null ? "Pending - New" : "Pending - Serial Mismatch",
+                reportedName, false);
+    }
+
+    // Raw ledger upsert, keyed by serial number - returns the canonical name
+    // already on record for this serial before this call (null if this serial has
+    // never been seen), so the caller can detect a rename/corruption of the
+    // reported name for an otherwise-known physical device.
+    private String upsertLedger(Connection conn, String serialNumber, String reportedName, String deviceType,
+                                 String groupIdentifier, Double latitude, Double longitude,
+                                 long nowEpochSec) throws SQLException {
         String existingCanonicalName = null;
         try (PreparedStatement select = conn.prepareStatement(
                 "SELECT canonical_name FROM " + REGISTRY_TABLE
@@ -371,14 +491,7 @@ public class TelepathonRegistryTask implements Task {
             }
         }
 
-        ReconcileOutcome outcome = decideReconciliation(existingCanonicalName, reportedName);
-
-        ensureProfileDefaults(conn, serialNumber, deviceType);
-
         if (existingCanonicalName == null) {
-            String duplicateOf = matchFingerprint(deviceType, groupIdentifier, latitude, longitude,
-                    loadFingerprintCandidates(conn, deviceType, serialNumber));
-
             try (PreparedStatement insert = conn.prepareStatement(
                     "INSERT INTO " + REGISTRY_TABLE + " (teleonome_name, serial_number, canonical_name, "
                             + "device_type, group_identifier, latitude, longitude, first_seen_epoch, "
@@ -395,34 +508,235 @@ public class TelepathonRegistryTask implements Task {
                 insert.setString(10, reportedName);
                 insert.executeUpdate();
             }
+            logger.info("TelepathonRegistryTask: ledger - new serial seen - serial='" + serialNumber
+                    + "' name='" + reportedName + "' type='" + deviceType + "'");
+            return null;
+        }
 
-            if (duplicateOf != null) {
-                outcome = new ReconcileOutcome("Possible Duplicate", reportedName, false, duplicateOf);
-                logger.warn("TelepathonRegistryTask: possible duplicate - serial='" + serialNumber
-                        + "' name='" + reportedName + "' fingerprint-matches existing device '" + duplicateOf
-                        + "'. Raw Data: " + rawData);
-            } else {
-                logger.info("TelepathonRegistryTask: new telepathon registered - serial='" + serialNumber
-                        + "' name='" + reportedName + "' type='" + deviceType + "'");
-            }
-        } else {
-            try (PreparedStatement update = conn.prepareStatement(
-                    "UPDATE " + REGISTRY_TABLE + " SET last_seen_epoch = ?, last_seen_reported_name = ?, "
-                            + "device_type = ? WHERE teleonome_name = ? AND serial_number = ?")) {
-                update.setLong(1, nowEpochSec);
-                update.setString(2, reportedName);
-                update.setString(3, deviceType);
-                update.setString(4, teleonomeName);
-                update.setString(5, serialNumber);
-                update.executeUpdate();
-            }
-            if (outcome.mismatch) {
-                logger.warn("TelepathonRegistryTask: identity mismatch - serial='" + serialNumber
-                        + "' registered as '" + existingCanonicalName + "' but this pulse reports name='"
-                        + reportedName + "'. Raw Data: " + rawData);
+        try (PreparedStatement update = conn.prepareStatement(
+                "UPDATE " + REGISTRY_TABLE + " SET last_seen_epoch = ?, last_seen_reported_name = ?, "
+                        + "device_type = ? WHERE teleonome_name = ? AND serial_number = ?")) {
+            update.setLong(1, nowEpochSec);
+            update.setString(2, reportedName);
+            update.setString(3, deviceType);
+            update.setString(4, teleonomeName);
+            update.setString(5, serialNumber);
+            update.executeUpdate();
+        }
+        return existingCanonicalName;
+    }
+
+    // ── Official / temporary-list curation ──────────────────────────────────────
+
+    private String selectOfficialSerial(Connection conn, String reportedName, String deviceType) throws SQLException {
+        try (PreparedStatement select = conn.prepareStatement(
+                "SELECT serial_number FROM " + OFFICIAL_TABLE
+                        + " WHERE teleonome_name = ? AND canonical_name = ? AND device_type = ?")) {
+            select.setString(1, teleonomeName);
+            select.setString(2, reportedName);
+            select.setString(3, deviceType);
+            try (ResultSet rs = select.executeQuery()) {
+                return rs.next() ? rs.getString(1) : null;
             }
         }
-        return outcome;
+    }
+
+    private void updateOfficialLastSeen(Connection conn, String reportedName, String deviceType,
+                                         long nowEpochSec) throws SQLException {
+        try (PreparedStatement update = conn.prepareStatement(
+                "UPDATE " + OFFICIAL_TABLE + " SET last_seen_epoch = ? "
+                        + "WHERE teleonome_name = ? AND canonical_name = ? AND device_type = ?")) {
+            update.setLong(1, nowEpochSec);
+            update.setString(2, teleonomeName);
+            update.setString(3, reportedName);
+            update.setString(4, deviceType);
+            update.executeUpdate();
+        }
+    }
+
+    // Promotes a (name, device_type) identity to the official table with the
+    // given serial number, overwriting whatever was there before (a previously
+    // wrong official entry gets corrected the same way a brand-new one gets
+    // created - see class javadoc: neither promotion path is a one-shot,
+    // first-only decision). Clears every pending row for this identity, whether
+    // or not it was the one promoted - the group is resolved either way.
+    private void promoteToOfficial(Connection conn, String reportedName, String deviceType, String serialNumber,
+                                    String source, long nowEpochSec) throws SQLException {
+        try (PreparedStatement upsert = conn.prepareStatement(
+                "INSERT INTO " + OFFICIAL_TABLE + " (teleonome_name, canonical_name, device_type, serial_number, "
+                        + "source, decided_epoch, last_seen_epoch) VALUES (?,?,?,?,?,?,?) "
+                        + "ON CONFLICT (teleonome_name, canonical_name, device_type) DO UPDATE SET "
+                        + "serial_number = EXCLUDED.serial_number, source = EXCLUDED.source, "
+                        + "decided_epoch = EXCLUDED.decided_epoch, last_seen_epoch = EXCLUDED.last_seen_epoch")) {
+            upsert.setString(1, teleonomeName);
+            upsert.setString(2, reportedName);
+            upsert.setString(3, deviceType);
+            upsert.setString(4, serialNumber);
+            upsert.setString(5, source);
+            upsert.setLong(6, nowEpochSec);
+            upsert.setLong(7, nowEpochSec);
+            upsert.executeUpdate();
+        }
+        try (PreparedStatement delete = conn.prepareStatement(
+                "DELETE FROM " + PENDING_TABLE + " WHERE teleonome_name = ? AND reported_name = ? AND device_type = ?")) {
+            delete.setString(1, teleonomeName);
+            delete.setString(2, reportedName);
+            delete.setString(3, deviceType);
+            delete.executeUpdate();
+        }
+        logger.info("TelepathonRegistryTask: promoted serial='" + serialNumber + "' to official for name='"
+                + reportedName + "' type='" + deviceType + "' (source=" + source + ")");
+    }
+
+    private void upsertPending(Connection conn, String reportedName, String deviceType, String serialNumber,
+                                String groupIdentifier, Double latitude, Double longitude,
+                                long nowEpochSec) throws SQLException {
+        try (PreparedStatement upsert = conn.prepareStatement(
+                "INSERT INTO " + PENDING_TABLE + " (teleonome_name, reported_name, device_type, serial_number, "
+                        + "group_identifier, latitude, longitude, first_seen_epoch, last_seen_epoch, occurrence_count) "
+                        + "VALUES (?,?,?,?,?,?,?,?,?,1) "
+                        + "ON CONFLICT (teleonome_name, reported_name, device_type, serial_number) DO UPDATE SET "
+                        + "last_seen_epoch = EXCLUDED.last_seen_epoch, "
+                        + "occurrence_count = " + PENDING_TABLE + ".occurrence_count + 1")) {
+            upsert.setString(1, teleonomeName);
+            upsert.setString(2, reportedName);
+            upsert.setString(3, deviceType);
+            upsert.setString(4, serialNumber);
+            upsert.setString(5, groupIdentifier);
+            if (latitude != null) upsert.setDouble(6, latitude); else upsert.setNull(6, java.sql.Types.DOUBLE);
+            if (longitude != null) upsert.setDouble(7, longitude); else upsert.setNull(7, java.sql.Types.DOUBLE);
+            upsert.setLong(8, nowEpochSec);
+            upsert.setLong(9, nowEpochSec);
+            upsert.executeUpdate();
+        }
+    }
+
+    private void purgeStalePending(Connection conn, long nowEpochSec, int daysInTemporaryList) throws SQLException {
+        long cutoffEpoch = nowEpochSec - daysInTemporaryList * 86_400L;
+        try (PreparedStatement delete = conn.prepareStatement(
+                "DELETE FROM " + PENDING_TABLE + " WHERE teleonome_name = ? AND first_seen_epoch < ?")) {
+            delete.setString(1, teleonomeName);
+            delete.setLong(2, cutoffEpoch);
+            int deleted = delete.executeUpdate();
+            if (deleted > 0) {
+                logger.info("TelepathonRegistryTask: purged " + deleted
+                        + " stale temporary-list entries older than " + daysInTemporaryList + " days");
+            }
+        }
+    }
+
+    // Live, forward-looking promotion signal: the (reported_name, device_type)
+    // group's most-recurring serial, promoted once it has been seen
+    // promotionThreshold-or-more times. Returns the promoted serial, or null if
+    // nothing in the group has reached the threshold yet.
+    private String checkPromotion(Connection conn, String reportedName, String deviceType, long nowEpochSec,
+                                   int promotionThreshold) throws SQLException {
+        try (PreparedStatement select = conn.prepareStatement(
+                "SELECT serial_number, occurrence_count FROM " + PENDING_TABLE
+                        + " WHERE teleonome_name = ? AND reported_name = ? AND device_type = ? "
+                        + "ORDER BY occurrence_count DESC LIMIT 1")) {
+            select.setString(1, teleonomeName);
+            select.setString(2, reportedName);
+            select.setString(3, deviceType);
+            try (ResultSet rs = select.executeQuery()) {
+                if (!rs.next()) return null;
+                String serial = rs.getString(1);
+                int count = rs.getInt(2);
+                if (count < promotionThreshold) return null;
+                promoteToOfficial(conn, reportedName, deviceType, serial, "Promotion Threshold", nowEpochSec);
+                return serial;
+            }
+        }
+    }
+
+    // Batch, self-healing promotion signal: tallies every historical
+    // telepathon_YYYY_M_D reading for this reported name (restricted to
+    // deviceType) over HISTORY_LOOKBACK_DAYS, and promotes the serial number if
+    // it's a clear (>50%) majority of readings, not merely a plurality - a
+    // near-even split is left for checkPromotion()'s live signal to eventually
+    // settle instead of force-deciding on a thin lead. This is what resolves an
+    // already-broken registry (e.g. six historical FISH/Daffodil serials) as soon
+    // as this code runs, without waiting for new pulses to accumulate.
+    private String reconcileFromHistory(Connection conn, String reportedName, String deviceType,
+                                         long nowEpochSec) throws SQLException {
+        long windowStartEpoch = nowEpochSec - HISTORY_LOOKBACK_DAYS * 86_400L;
+        JSONArray rows;
+        try {
+            rows = PostgresqlPersistenceManager.instance()
+                    .getTelepathonDataStart(reportedName, windowStartEpoch, nowEpochSec);
+        } catch (Exception e) {
+            logger.debug("TelepathonRegistryTask: history lookup failed for name='" + reportedName + "': "
+                    + e.getMessage());
+            return null;
+        }
+
+        Map<String, Integer> occurrencesBySerial = new HashMap<>();
+        int totalMatchingRows = 0;
+        for (int i = 0; i < rows.length(); i++) {
+            JSONObject data = rows.getJSONObject(i).optJSONObject("data");
+            if (data == null) continue;
+            if (!deviceType.equals(getDeneWordString(data, "Configuration", "Device Type Id"))) continue;
+            String serial = data.optString("Serial Number", "");
+            if (serial.isEmpty()) continue;
+            occurrencesBySerial.merge(serial, 1, Integer::sum);
+            totalMatchingRows++;
+        }
+        if (occurrencesBySerial.isEmpty()) return null;
+
+        String bestSerial = null;
+        int bestCount = 0;
+        for (Map.Entry<String, Integer> entry : occurrencesBySerial.entrySet()) {
+            if (entry.getValue() > bestCount) {
+                bestSerial = entry.getKey();
+                bestCount = entry.getValue();
+            }
+        }
+        if (bestSerial == null || bestCount * 2 <= totalMatchingRows) return null;
+
+        promoteToOfficial(conn, reportedName, deviceType, bestSerial, "History Majority", nowEpochSec);
+        return bestSerial;
+    }
+
+    // Called from sweep() so devices that aren't currently pulsing still get
+    // resolved onto the official list every 5-minute sweep interval, not only
+    // when they next happen to pulse and go through reconcile() themselves.
+    private void reconcileAllPendingGroups(Connection conn, long nowEpochSec, int promotionThreshold) throws SQLException {
+        List<String[]> groups = new ArrayList<>();
+        try (PreparedStatement select = conn.prepareStatement(
+                "SELECT DISTINCT reported_name, device_type FROM " + PENDING_TABLE + " WHERE teleonome_name = ?")) {
+            select.setString(1, teleonomeName);
+            try (ResultSet rs = select.executeQuery()) {
+                while (rs.next()) groups.add(new String[]{rs.getString(1), rs.getString(2)});
+            }
+        }
+        for (String[] group : groups) {
+            String promoted = checkPromotion(conn, group[0], group[1], nowEpochSec, promotionThreshold);
+            if (promoted == null) {
+                reconcileFromHistory(conn, group[0], group[1], nowEpochSec);
+            }
+        }
+    }
+
+    private String pendingToJson(Connection conn) throws SQLException {
+        JSONArray arr = new JSONArray();
+        try (PreparedStatement select = conn.prepareStatement(
+                "SELECT reported_name, device_type, serial_number, occurrence_count, first_seen_epoch "
+                        + "FROM " + PENDING_TABLE + " WHERE teleonome_name = ? "
+                        + "ORDER BY reported_name, device_type, occurrence_count DESC")) {
+            select.setString(1, teleonomeName);
+            try (ResultSet rs = select.executeQuery()) {
+                while (rs.next()) {
+                    JSONObject o = new JSONObject();
+                    o.put("Name", rs.getString(1));
+                    o.put("Device Type", rs.getString(2));
+                    o.put("Serial Number", rs.getString(3));
+                    o.put("Occurrence Count", rs.getInt(4));
+                    o.put("First Seen Epoch", rs.getLong(5));
+                    arr.put(o);
+                }
+            }
+        }
+        return arr.toString();
     }
 
     // ── Device profile ───────────────────────────────────────────────────────────
@@ -567,7 +881,7 @@ public class TelepathonRegistryTask implements Task {
         List<DeviceStatus> all = new ArrayList<>();
         try (PreparedStatement select = conn.prepareStatement(
                 "SELECT serial_number, canonical_name, device_type, last_seen_epoch, last_alert_status "
-                        + "FROM " + REGISTRY_TABLE + " WHERE teleonome_name = ?")) {
+                        + "FROM " + OFFICIAL_TABLE + " WHERE teleonome_name = ?")) {
             select.setString(1, teleonomeName);
             try (ResultSet rs = select.executeQuery()) {
                 while (rs.next()) {
@@ -581,7 +895,7 @@ public class TelepathonRegistryTask implements Task {
 
                     boolean statusChanged = !status.equals(previousStatus == null ? "OK" : previousStatus);
                     if (statusChanged) {
-                        updateAlertStatus(conn, serialNumber, status);
+                        updateAlertStatus(conn, canonicalName, deviceType, status);
                     }
                     // Never alert on recovery (status == "OK") - only on entering or
                     // escalating within WARNING/CRITICAL.
@@ -594,12 +908,15 @@ public class TelepathonRegistryTask implements Task {
         return all;
     }
 
-    private void updateAlertStatus(Connection conn, String serialNumber, String status) throws SQLException {
+    private void updateAlertStatus(Connection conn, String canonicalName, String deviceType,
+                                    String status) throws SQLException {
         try (PreparedStatement update = conn.prepareStatement(
-                "UPDATE " + REGISTRY_TABLE + " SET last_alert_status = ? WHERE teleonome_name = ? AND serial_number = ?")) {
+                "UPDATE " + OFFICIAL_TABLE + " SET last_alert_status = ? "
+                        + "WHERE teleonome_name = ? AND canonical_name = ? AND device_type = ?")) {
             update.setString(1, status);
             update.setString(2, teleonomeName);
-            update.setString(3, serialNumber);
+            update.setString(3, canonicalName);
+            update.setString(4, deviceType);
             update.executeUpdate();
         }
     }
