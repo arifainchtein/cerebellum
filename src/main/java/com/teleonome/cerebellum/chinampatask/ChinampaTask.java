@@ -40,7 +40,7 @@ public class ChinampaTask implements Task {
     private Double lastSumpTroughHeight;
     private Long   lastPulseEpochSec;
 
-    public ChinampaTask(String deviceName) {
+    public ChinampaTask(String teleonomeName, String deviceName) {
         this.deviceName = deviceName;
     }
 
