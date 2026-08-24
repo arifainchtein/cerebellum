@@ -13,15 +13,24 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * Purpose: read TelepathonRegistryTask's two temporary-list/promotion config values -
- * "Days in Temporary List" and "Promotion Threshold" - straight from the live denome,
- * per Internal:Cerebellum:Configuration (the Configuration Dene already exists there
- * under every host's live Teleonome.denome, currently empty - add the two DeneWords
- * below to it, no version-controlled template, same "wire it into the live file"
- * convention as every other Cerebellum Task Dene in this repo):
+ * Purpose: read TelepathonRegistryTask's temporary-list/promotion/lateness config
+ * values - "Days in Temporary List", "Promotion Threshold", and "Days Before Stale" -
+ * straight from the live denome, per Internal:Cerebellum:Configuration (the
+ * Configuration Dene already exists there under every host's live Teleonome.denome -
+ * add the three DeneWords below to it, no version-controlled template, same "wire it
+ * into the live file" convention as every other Cerebellum Task Dene in this repo):
  *
  *   { "Name": "Days in Temporary List", "Value": 7, "Value Type": "int", "Required": true }
  *   { "Name": "Promotion Threshold",    "Value": 3, "Value Type": "int", "Required": true }
+ *   { "Name": "Days Before Stale",      "Value": 2, "Value Type": "int", "Required": true }
+ *
+ * "Days Before Stale" is unrelated to the other two - those govern promoting a *new,
+ * unconfirmed* identity into the official registry (telepathon_registry_pending), while
+ * "Days Before Stale" governs how long an *already-official* device can go silent
+ * before evaluateDeviceStatuses() calls it "Stale" rather than merely "Late" (see
+ * TelepathonRegistryTask.thresholdsFor()). Kept in the same Configuration Dene for
+ * discoverability, but deliberately a separate DeneWord rather than reusing Promotion
+ * Threshold/Days in Temporary List, which would conflate two independent policies.
  *
  * TelepathonRegistryTask.process()/sweep() have no direct access to the full pulse
  * (Task.process() is only ever handed the one Telepathon's DeneChain - see Task.java),
@@ -42,18 +51,21 @@ class CerebellumConfigClient {
 
     static final int DEFAULT_DAYS_IN_TEMPORARY_LIST = 7;
     static final int DEFAULT_PROMOTION_THRESHOLD = 3;
+    static final int DEFAULT_DAYS_BEFORE_STALE = 2;
 
     static class RegistryConfig {
         final int daysInTemporaryList;
         final int promotionThreshold;
-        RegistryConfig(int daysInTemporaryList, int promotionThreshold) {
+        final int daysBeforeStale;
+        RegistryConfig(int daysInTemporaryList, int promotionThreshold, int daysBeforeStale) {
             this.daysInTemporaryList = daysInTemporaryList;
             this.promotionThreshold = promotionThreshold;
+            this.daysBeforeStale = daysBeforeStale;
         }
     }
 
     private static final RegistryConfig DEFAULTS =
-            new RegistryConfig(DEFAULT_DAYS_IN_TEMPORARY_LIST, DEFAULT_PROMOTION_THRESHOLD);
+            new RegistryConfig(DEFAULT_DAYS_IN_TEMPORARY_LIST, DEFAULT_PROMOTION_THRESHOLD, DEFAULT_DAYS_BEFORE_STALE);
 
     private static final Duration REQUEST_TIMEOUT = Duration.ofSeconds(5);
     private static final long CACHE_TTL_MILLIS = 5 * 60_000;
@@ -100,7 +112,8 @@ class CerebellumConfigClient {
 
             int days = readInt(configurationDene, "Days in Temporary List", DEFAULT_DAYS_IN_TEMPORARY_LIST);
             int threshold = readInt(configurationDene, "Promotion Threshold", DEFAULT_PROMOTION_THRESHOLD);
-            return new RegistryConfig(days, threshold);
+            int daysBeforeStale = readInt(configurationDene, "Days Before Stale", DEFAULT_DAYS_BEFORE_STALE);
+            return new RegistryConfig(days, threshold, daysBeforeStale);
         } catch (Exception e) {
             logger.debug("CerebellumConfigClient: failed to fetch config for '" + teleonomeName
                     + "', using defaults: " + e.getMessage());

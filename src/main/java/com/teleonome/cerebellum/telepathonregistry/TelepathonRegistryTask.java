@@ -125,11 +125,15 @@ import java.util.Map;
  *
  * Pending rows older than "Days in Temporary List" days are purged
  * (purgeStalePending()) before every promotion check, so a single corrupted
- * reading can't sit accumulating count indefinitely. Both "Days in Temporary
- * List" and "Promotion Threshold" are DeneWords under
- * Internal:Cerebellum:Configuration in the live Teleonome.denome - see
+ * reading can't sit accumulating count indefinitely. "Days in Temporary
+ * List", "Promotion Threshold", and "Days Before Stale" are all DeneWords
+ * under Internal:Cerebellum:Configuration in the live Teleonome.denome - see
  * CerebellumConfigClient for the exact shape and defaults (7 days / 3
- * occurrences) used when that Dene is missing or unreachable.
+ * occurrences / 2 days) used when that Dene is missing or unreachable. The
+ * first two govern promoting a *new* identity into the official registry;
+ * "Days Before Stale" is unrelated - it governs how long an *already-official*
+ * device can go silent before evaluateDeviceStatuses() escalates it from
+ * "Late" (WARNING) to "Stale" (CRITICAL) - see thresholdsFor().
  *
  * telepathon_registry (the original table) keeps its original job as a raw,
  * never-forgets ledger keyed by serial_number - upsertLedger() still uses it for
@@ -190,9 +194,17 @@ public class TelepathonRegistryTask implements Task {
                 "Valentino Build 2, Langley Build 2", "LiFePO4 1S", null, null));
     }
 
-    // [WARNING_SEC, CRITICAL_SEC] per Device Type Id. Langley is the one entry
-    // backed by real data (~1s pulse cadence, matches LangleySilenceSweep). Every
-    // other entry is a placeholder pending real numbers - see class javadoc.
+    // [WARNING_SEC, ...] per Device Type Id - only element [0] (WARNING, i.e. "Late")
+    // is used any more. Langley's WARNING value is backed by real data (~1s pulse
+    // cadence, matches LangleySilenceSweep); every other entry is a placeholder pending
+    // real numbers - see class javadoc. A second element is kept in each array for
+    // history/documentation but ignored by thresholdsFor(): the old CRITICAL cutoff
+    // this used to hold has been replaced by the denome-configurable "Days Before
+    // Stale" (teleonome-wide, not per-device-type - see CerebellumConfigClient). That
+    // change exists because an established device with days of continuous history
+    // (e.g. Chinampa) was going "Stale" after the same ~1hr silence gap used to flag a
+    // barely-promoted device - there was no way to give a proven device more benefit of
+    // the doubt before this.
     private static final Map<String, long[]> SILENCE_THRESHOLDS_SEC = new HashMap<>();
     static {
         SILENCE_THRESHOLDS_SEC.put("Langley", new long[]{5 * 60, 20 * 60});
@@ -202,7 +214,7 @@ public class TelepathonRegistryTask implements Task {
         SILENCE_THRESHOLDS_SEC.put("Daffodil", new long[]{30 * 60, 60 * 60});
     }
     // TODO: placeholder for any Device Type Id not listed above (Gloria, Chinampa,
-    // Valentino-based devices, ...) - needs real per-type numbers.
+    // Valentino-based devices, ...) - needs a real per-type WARNING number.
     private static final long[] DEFAULT_THRESHOLDS_SEC = {30 * 60, 60 * 60};
 
     // Shared across every per-device instance (same rationale as
@@ -293,7 +305,7 @@ public class TelepathonRegistryTask implements Task {
             purgeStalePending(conn, nowEpochSec, config.daysInTemporaryList);
             reconcileAllPendingGroups(conn, nowEpochSec, config.promotionThreshold);
 
-            List<DeviceStatus> all = evaluateDeviceStatuses(conn, nowEpochSec);
+            List<DeviceStatus> all = evaluateDeviceStatuses(conn, nowEpochSec, config.daysBeforeStale);
             words.put(deneWord("Telepathon Registry Pending Devices", pendingToJson(conn), "String"));
             List<DeviceStatus> late = new ArrayList<>();
             String worst = "OK";
@@ -860,9 +872,14 @@ public class TelepathonRegistryTask implements Task {
         }
     }
 
-    long[] thresholdsFor(String deviceType) {
-        long[] thresholds = SILENCE_THRESHOLDS_SEC.get(deviceType);
-        return thresholds != null ? thresholds : DEFAULT_THRESHOLDS_SEC;
+    // daysBeforeStale is teleonome-wide (Internal:Cerebellum:Configuration's "Days
+    // Before Stale", read once per sweep - see CerebellumConfigClient), not
+    // per-device-type - every device type on this teleonome gets the same grace period
+    // before "Stale", while WARNING/"Late" stays per-device-type as before.
+    long[] thresholdsFor(String deviceType, int daysBeforeStale) {
+        long[] base = SILENCE_THRESHOLDS_SEC.get(deviceType);
+        long warningSec = (base != null ? base : DEFAULT_THRESHOLDS_SEC)[0];
+        return new long[]{ warningSec, daysBeforeStale * 86_400L };
     }
 
     String statusFor(long ageSec, long[] thresholds) {
@@ -877,7 +894,8 @@ public class TelepathonRegistryTask implements Task {
     // device that's simply still late from before (not worth re-alerting on
     // every 5-minute sweep) - see DeviceStatus.alertWorthy and
     // telepathon_registry.sql's column comment.
-    private List<DeviceStatus> evaluateDeviceStatuses(Connection conn, long nowEpochSec) throws SQLException {
+    private List<DeviceStatus> evaluateDeviceStatuses(Connection conn, long nowEpochSec,
+                                                       int daysBeforeStale) throws SQLException {
         List<DeviceStatus> all = new ArrayList<>();
         try (PreparedStatement select = conn.prepareStatement(
                 "SELECT serial_number, canonical_name, device_type, last_seen_epoch, last_alert_status "
@@ -891,7 +909,7 @@ public class TelepathonRegistryTask implements Task {
                     long lastSeenEpochSec = rs.getLong(4);
                     String previousStatus = rs.getString(5); // null = never swept, treat as "OK"
                     long ageSec = nowEpochSec - lastSeenEpochSec;
-                    String status = statusFor(ageSec, thresholdsFor(deviceType));
+                    String status = statusFor(ageSec, thresholdsFor(deviceType, daysBeforeStale));
 
                     boolean statusChanged = !status.equals(previousStatus == null ? "OK" : previousStatus);
                     if (statusChanged) {
