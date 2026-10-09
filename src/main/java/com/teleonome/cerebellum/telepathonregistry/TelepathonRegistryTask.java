@@ -465,9 +465,11 @@ public class TelepathonRegistryTask implements Task {
             promoted = reconcileFromHistory(conn, reportedName, deviceType, nowEpochSec);
         }
         if (promoted != null) {
-            return promoted.equals(serialNumber)
-                    ? new ReconcileOutcome("OK", reportedName, false)
-                    : new ReconcileOutcome("Correction Needed", reportedName, true);
+            if (promoted.equals(serialNumber)) {
+                updateOfficialLastSeen(conn, reportedName, deviceType, nowEpochSec);
+                return new ReconcileOutcome("OK", reportedName, false);
+            }
+            return new ReconcileOutcome("Correction Needed", reportedName, true);
         }
 
         String duplicateOf = matchFingerprint(deviceType, groupIdentifier, latitude, longitude,
@@ -572,21 +574,31 @@ public class TelepathonRegistryTask implements Task {
     // created - see class javadoc: neither promotion path is a one-shot,
     // first-only decision). Clears every pending row for this identity, whether
     // or not it was the one promoted - the group is resolved either way.
+    //
+    // lastSeenEpochSec is when the promoted serial was actually last heard under
+    // this name - NOT the time of the promotion. Stamping "now" here made the
+    // ghSUMP ghost (one garbled Chinampa packet, still sitting in the live denome
+    // and re-processed every pulse with a different garbled serial) get
+    // re-promoted from history every pulse and so always look 0s-fresh/"OK".
+    // Re-promoting the same serial never moves last_seen backwards.
     private void promoteToOfficial(Connection conn, String reportedName, String deviceType, String serialNumber,
-                                    String source, long nowEpochSec) throws SQLException {
+                                    String source, long nowEpochSec, long lastSeenEpochSec) throws SQLException {
         try (PreparedStatement upsert = conn.prepareStatement(
                 "INSERT INTO " + OFFICIAL_TABLE + " (teleonome_name, canonical_name, device_type, serial_number, "
                         + "source, decided_epoch, last_seen_epoch) VALUES (?,?,?,?,?,?,?) "
                         + "ON CONFLICT (teleonome_name, canonical_name, device_type) DO UPDATE SET "
                         + "serial_number = EXCLUDED.serial_number, source = EXCLUDED.source, "
-                        + "decided_epoch = EXCLUDED.decided_epoch, last_seen_epoch = EXCLUDED.last_seen_epoch")) {
+                        + "decided_epoch = EXCLUDED.decided_epoch, last_seen_epoch = CASE "
+                        + "WHEN " + OFFICIAL_TABLE + ".serial_number = EXCLUDED.serial_number "
+                        + "THEN GREATEST(" + OFFICIAL_TABLE + ".last_seen_epoch, EXCLUDED.last_seen_epoch) "
+                        + "ELSE EXCLUDED.last_seen_epoch END")) {
             upsert.setString(1, teleonomeName);
             upsert.setString(2, reportedName);
             upsert.setString(3, deviceType);
             upsert.setString(4, serialNumber);
             upsert.setString(5, source);
             upsert.setLong(6, nowEpochSec);
-            upsert.setLong(7, nowEpochSec);
+            upsert.setLong(7, lastSeenEpochSec);
             upsert.executeUpdate();
         }
         try (PreparedStatement delete = conn.prepareStatement(
@@ -644,7 +656,7 @@ public class TelepathonRegistryTask implements Task {
     private String checkPromotion(Connection conn, String reportedName, String deviceType, long nowEpochSec,
                                    int promotionThreshold) throws SQLException {
         try (PreparedStatement select = conn.prepareStatement(
-                "SELECT serial_number, occurrence_count FROM " + PENDING_TABLE
+                "SELECT serial_number, occurrence_count, last_seen_epoch FROM " + PENDING_TABLE
                         + " WHERE teleonome_name = ? AND reported_name = ? AND device_type = ? "
                         + "ORDER BY occurrence_count DESC LIMIT 1")) {
             select.setString(1, teleonomeName);
@@ -655,7 +667,9 @@ public class TelepathonRegistryTask implements Task {
                 String serial = rs.getString(1);
                 int count = rs.getInt(2);
                 if (count < promotionThreshold) return null;
-                promoteToOfficial(conn, reportedName, deviceType, serial, "Promotion Threshold", nowEpochSec);
+                long lastSeenEpochSec = rs.getLong(3);
+                promoteToOfficial(conn, reportedName, deviceType, serial, "Promotion Threshold", nowEpochSec,
+                        lastSeenEpochSec);
                 return serial;
             }
         }
@@ -683,6 +697,7 @@ public class TelepathonRegistryTask implements Task {
         }
 
         Map<String, Integer> occurrencesBySerial = new HashMap<>();
+        Map<String, Long> lastSeenBySerial = new HashMap<>();
         int totalMatchingRows = 0;
         for (int i = 0; i < rows.length(); i++) {
             JSONObject data = rows.getJSONObject(i).optJSONObject("data");
@@ -691,6 +706,7 @@ public class TelepathonRegistryTask implements Task {
             String serial = data.optString("Serial Number", "");
             if (serial.isEmpty()) continue;
             occurrencesBySerial.merge(serial, 1, Integer::sum);
+            lastSeenBySerial.merge(serial, rows.getJSONObject(i).optLong("timeSeconds", 0L), Math::max);
             totalMatchingRows++;
         }
         if (occurrencesBySerial.isEmpty()) return null;
@@ -705,7 +721,8 @@ public class TelepathonRegistryTask implements Task {
         }
         if (bestSerial == null || bestCount * 2 <= totalMatchingRows) return null;
 
-        promoteToOfficial(conn, reportedName, deviceType, bestSerial, "History Majority", nowEpochSec);
+        promoteToOfficial(conn, reportedName, deviceType, bestSerial, "History Majority", nowEpochSec,
+                lastSeenBySerial.get(bestSerial));
         return bestSerial;
     }
 
