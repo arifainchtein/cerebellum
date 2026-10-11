@@ -55,10 +55,15 @@ public class PulseTask implements Task {
 
     private int pulseCount = 0;
 
+    // Battery ledger SOC (Vital Signs v3 + Power Profile), published next to "Battery SOC Live %"
+    // for comparison - see LedgerSoc. Publishes nothing until the device sends both.
+    private final LedgerSoc ledgerSoc;
+
     public PulseTask(String teleonomeName, String deviceName) {
         this.teleonomeName = teleonomeName;
         this.deviceName = deviceName;
         this.logger = Logger.getLogger(getClass());
+        this.ledgerSoc = new LedgerSoc(deviceName);
     }
 
     @Override public String getName()       { return "PulseTask"; }
@@ -114,6 +119,12 @@ public class PulseTask implements Task {
 
         JSONArray words = new JSONArray();
         words.put(deneWord("Battery SOC Live %", socPct, "double"));
+        try {
+            JSONArray ledgerWords = ledgerSoc.update(telepathon);
+            for (int i = 0; i < ledgerWords.length(); i++) words.put(ledgerWords.get(i));
+        } catch (Exception e) {
+            logger.warn("PulseTask[" + deviceName + "]: ledger SOC failed: " + e.getMessage());
+        }
         return words;
     }
 
