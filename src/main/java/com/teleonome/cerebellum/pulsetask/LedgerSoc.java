@@ -29,7 +29,7 @@ import org.json.JSONObject;
  * charge between them (PulseTask re-anchors on every rest-state pulse, i.e. every packet of a
  * sleeping device at night, which would make the ledger irrelevant):
  *   - bootstrap on the first usable record,
- *   - at or above the reliable-zone voltage (curve is steep there): at most once an hour,
+ *   - at or above the reliable-zone voltage (curve is steep there) and not charging: at most once an hour,
  *   - at rest in the flat zone (night/sleep, or a brief wake): at most every 6 hours.
  *
  * State is in memory, like every Cerebellum task: a Cerebellum restart re-bootstraps.
@@ -58,6 +58,7 @@ public class LedgerSoc {
     private static final double MAX_AWAKE_SCALE = 1.5;     // cap on the missed-awake-time correction
     private static final long RELIABLE_ANCHOR_INTERVAL_SEC = 3600;
     private static final long REST_ANCHOR_INTERVAL_SEC = 6 * 3600;
+    private static final double CHARGING_THRESHOLD_MA = 5.0;
 
     private final String deviceName;
     private final Logger logger = Logger.getLogger(getClass());
@@ -100,6 +101,7 @@ public class LedgerSoc {
         double voltage = num(dene(telepathon, "Purpose"), "Battery Voltage", 0);
         double operatingStatus = num(dene(telepathon, "Purpose"), "Operating Status", -1);
         double wakeTimeSec = num(dene(telepathon, "Purpose"), "Wake Time Sec", 999);
+        double batteryCurrent = num(dene(telepathon, "Purpose"), "Battery Current", 0);   // mA, negative = charging
 
         // ── ledger step, once per new Vital Signs record ─────────────────────────
         if (received > 0 && received != lastReceived) {
@@ -136,11 +138,13 @@ public class LedgerSoc {
             double reliableCellV = reliableZoneCellVoltage(chemistry);
             double flatMinCellV = flatZoneMinCellVoltage(chemistry);
             boolean atRest = operatingStatus == 0.0 || wakeTimeSec <= OCV_MAX_WAKE_SEC;
+            // a charging cell reads well above its rest voltage, so the reliable zone needs the cell not charging
+            boolean charging = batteryCurrent < -CHARGING_THRESHOLD_MA;
             long nowSec = System.currentTimeMillis() / 1000;
             long sinceAnchor = nowSec - lastAnchorEpoch;
             String reason = null;
             if (chargeMah < 0) reason = "bootstrap";
-            else if (cellV >= reliableCellV && sinceAnchor >= RELIABLE_ANCHOR_INTERVAL_SEC) reason = "reliable zone";
+            else if (cellV >= reliableCellV && !charging && sinceAnchor >= RELIABLE_ANCHOR_INTERVAL_SEC) reason = "reliable zone";
             else if (cellV >= flatMinCellV && cellV < reliableCellV && atRest && sinceAnchor >= REST_ANCHOR_INTERVAL_SEC) reason = "rest-state OCV";
             if (reason != null) {
                 double before = chargeMah;
@@ -176,7 +180,9 @@ public class LedgerSoc {
     private static double reliableZoneCellVoltage(String chemistry) {
         if ("Lead-Acid".equals(chemistry)) return 2.12;
         if ("Li-Ion".equals(chemistry)) return 4.10;
-        return 3.30;
+        // LiFePO4: 3.30 V is the middle of the flat plateau (70%) - a cell sits there all night, which
+        // re-anchored the ledger every hour (2026-10-13). The curve is only steep from 3.40 V (90%).
+        return 3.40;
     }
 
     private static double flatZoneMinCellVoltage(String chemistry) {
